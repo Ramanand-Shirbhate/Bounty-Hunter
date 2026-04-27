@@ -24,13 +24,15 @@ MY_SKILLS = "TypeScript, Node.js, React, and basic Python."
 # ---------------------------------------------------------
 def fetch_potential_bounties():
     url = "https://api.github.com/search/issues"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    # Updated to Bearer token
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     query = "is:issue is:open label:bounty no:assignee"
     params = {"q": query, "sort": "created", "order": "desc", "per_page": 5}
     
     print("\n🔍 Scouting GitHub for fresh bounties...")
     response = requests.get(url, headers=headers, params=params)
     if response.status_code != 200:
+        print(f"❌ GitHub API Error Fetching Bounties: {response.text}")
         return []
         
     data = response.json()
@@ -51,7 +53,8 @@ def fetch_potential_bounties():
     return good_bounties
 
 def fetch_issue_comments(comments_url):
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    # Updated to Bearer token
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     response = requests.get(comments_url, headers=headers)
     if response.status_code == 200:
         comments_data = response.json()
@@ -140,10 +143,23 @@ def send_telegram_confirmation(text):
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
 
 def post_github_comment(api_comments_url):
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    # Updated to Bearer token
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     comment_body = {"body": "/attempt\n\nHi there! I'd love to take this on. I have strong experience with this stack and can start working on a clean, well-tested PR immediately."}
+    
+    print(f"🚀 Posting official claim to GitHub...")
     response = requests.post(api_comments_url, headers=headers, json=comment_body)
-    return response.status_code == 201
+    
+    if response.status_code == 201:
+        return True, "Success"
+    else:
+        # Extract the exact error message to send back to Telegram
+        try:
+            error_details = response.json().get('message', response.text)
+        except:
+            error_details = response.text
+        print(f"❌ GitHub API Error: {error_details}")
+        return False, error_details
 
 # ---------------------------------------------------------
 # 5. THE BOT LOOP (Runs in Background)
@@ -170,10 +186,15 @@ def run_bounty_hunter():
             
             if user_choice > 0 and user_choice <= len(high_score_bounties):
                 selected = high_score_bounties[user_choice - 1]
-                if post_github_comment(selected["api_comments_url"]):
+                
+                # Capture both success status and the error message
+                success, error_msg = post_github_comment(selected["api_comments_url"])
+                
+                if success:
                     send_telegram_confirmation(f"✅ Successfully posted `/attempt` on:\n{selected['title']}")
                 else:
-                    send_telegram_confirmation(f"❌ Error posting comment.")
+                    # Send the exact GitHub error directly to your phone
+                    send_telegram_confirmation(f"❌ Error posting to GitHub.\n\nReason: {error_msg}")
             else:
                 send_telegram_confirmation("⏭️ Skipped.")
         else:
