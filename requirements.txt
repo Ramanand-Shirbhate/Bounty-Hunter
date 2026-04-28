@@ -2,3 +2,4 @@ requests
 groq
 python-dotenv
 flask
+google-generativeai
