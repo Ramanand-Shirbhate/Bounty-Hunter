@@ -5,6 +5,7 @@ import threading
 import requests
 from flask import Flask
 from groq import Groq
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------
@@ -15,15 +16,21 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+
 MY_SKILLS = "TypeScript, Node.js, React, and basic Python."
 
-# Global tracker for Telegram updates so we don't process the same button click twice
+# Global State Management
 LAST_UPDATE_ID = None
+PREVIOUS_BOUNTY_IDS = []  # Used to check for duplicates (Silent Msgs)
+BOUNTY_CACHE = {}         # Stores bounties so old Telegram buttons still work
 
 # ---------------------------------------------------------
-# 2. GITHUB DATA FETCHERS
+# 2. GITHUB DATA FETCHERS & ACTIONS
 # ---------------------------------------------------------
 def fetch_potential_bounties():
     url = "https://api.github.com/search/issues"
@@ -34,7 +41,6 @@ def fetch_potential_bounties():
     print("\n🔍 Scouting GitHub for fresh bounties...")
     response = requests.get(url, headers=headers, params=params)
     if response.status_code != 200:
-        print(f"❌ GitHub API Error Fetching Bounties: {response.text}")
         return []
         
     data = response.json()
@@ -46,12 +52,16 @@ def fetch_potential_bounties():
         if any(bad in l for l in labels for bad in bad_labels):
             continue 
             
-        good_bounties.append({
+        bounty = {
+            "id": str(issue["id"]), # Unique ID for the cache
             "title": issue["title"],
             "url": issue["html_url"],
             "api_comments_url": issue["comments_url"], 
             "body": str(issue["body"])[:2000]
-        })
+        }
+        good_bounties.append(bounty)
+        BOUNTY_CACHE[bounty["id"]] = bounty # Save to memory for old buttons
+        
     return good_bounties
 
 def fetch_issue_comments(comments_url):
@@ -59,21 +69,39 @@ def fetch_issue_comments(comments_url):
     response = requests.get(comments_url, headers=headers)
     if response.status_code == 200:
         comments_data = response.json()
-        if not comments_data:
-            return "No comments yet."
+        if not comments_data: return "No comments yet."
         chat_log = "\n".join([f"{c['user']['login']}: {c['body']}" for c in comments_data])
         return chat_log[:1500] 
     return "Could not fetch comments."
 
+def fork_repository(html_url):
+    """Phase 2 Setup: Automatically forks the repo to your account."""
+    try:
+        parts = html_url.split('/')
+        owner, repo = parts[3], parts[4]
+        url = f"https://api.github.com/repos/{owner}/{repo}/forks"
+        headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+        
+        response = requests.post(url, headers=headers)
+        if response.status_code in [202, 201]:
+            return True, repo
+        return False, "API blocked fork."
+    except Exception as e:
+        return False, str(e)
+
 # ---------------------------------------------------------
-# 3. GROQ AI EVALUATORS
+# 3. AI ENGINES (GROQ & GEMINI)
 # ---------------------------------------------------------
 def evaluate_bounty(title, body, comments_text):
+    """Groq Evaluator: Now strict on Fiat/USD Money."""
     system_prompt = f"""
-    You are an expert senior developer evaluating open-source bounties for me. My tech stack is: {MY_SKILLS}.
-    Read the issue description AND the comment history. If comments show someone else claimed it, set is_winnable to false.
-    Return ONLY a valid JSON object:
-    {{"score": <int 1-10>, "is_winnable": <bool>, "reason": "<One short sentence>"}}
+    You evaluate bounties. Tech stack: {MY_SKILLS}.
+    1. Read the issue and comments. If claimed, set is_winnable: false.
+    2. CHECK THE REWARD: Look for USD, USDC, or Fiat amounts (e.g. $100). 
+       If the reward is in a random altcoin (RTC, tokens) or missing, set is_winnable: false.
+    
+    Return ONLY JSON:
+    {{"score": <int 1-10>, "is_winnable": <bool>, "reward": "<Extract the $ amount>", "reason": "<Short sentence>"}}
     """
     try:
         completion = groq_client.chat.completions.create(
@@ -84,30 +112,31 @@ def evaluate_bounty(title, body, comments_text):
         )
         return json.loads(completion.choices[0].message.content)
     except:
-        return {"score": 0, "is_winnable": False, "reason": "API Error"}
+        return {"score": 0, "is_winnable": False, "reward": "Unknown", "reason": "API Error"}
 
-def generate_bounty_comparison(high_score_bounties):
-    if len(high_score_bounties) < 2:
-        return "<i>Only one high-match bounty found this round. No comparison needed.</i>"
+def generate_advanced_claim(title, body, comments):
+    """Gemini AI: Generates a contextual, intelligent claim comment."""
+    prompt = f"""
+    I want to claim this GitHub bounty. Write a highly professional comment to post.
+    Start with exactly "/attempt".
+    Read the issue body, infer which files/modules need to be edited, and state that I will begin auditing/working on those specific modules. 
+    Keep it concise, confident, and under 4 sentences.
     
-    bounty_context = "".join([f"Option [{i}]: {b['title']} (Score: {b['score']}/10)\nWhy: {b['reason']}\n\n" for i, b in enumerate(high_score_bounties, 1)])
-    system_prompt = f"You are my technical career advisor. My skills: {MY_SKILLS}. Read these summaries and write a 2-3 sentence comparison stating which is the fastest win. No markdown asterisks."
-    
+    Title: {title}
+    Body: {body}
+    Existing Comments: {comments}
+    """
     try:
-        completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": bounty_context}],
-            temperature=0.3 
-        )
-        return completion.choices[0].message.content
-    except:
-        return "Comparison failed."
+        response = gemini_model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"Gemini Error: {e}")
+        return "/attempt\n\nHi there! I have strong experience with this stack and would love to take this on. I will begin setting up my environment and auditing the required modules immediately."
 
 # ---------------------------------------------------------
-# 4. TELEGRAM COMMUNICATION (WITH BUTTONS & TIMEOUTS)
+# 4. TELEGRAM COMMUNICATION (SILENT NOTIFICATIONS)
 # ---------------------------------------------------------
 def flush_telegram_updates():
-    """Clears old button clicks so it doesn't trigger on startup."""
     global LAST_UPDATE_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     try:
@@ -115,146 +144,143 @@ def flush_telegram_updates():
         if res.get("result"): LAST_UPDATE_ID = res["result"][-1]["update_id"]
     except: pass
 
-def send_telegram_menu(bounties_list, comparison_text):
-    """Sends the menu with inline 'Claim' and 'Skip' buttons."""
+def send_telegram_menu(bounties_list, is_duplicate=False):
+    """Sends menu. Uses silent notification if we've seen these bounties recently."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    message = f"🚨 <b>Found Top Bounties!</b>\n\n🤖 <b>AI Analyst Verdict:</b>\n{comparison_text}\n\n" + "➖"*15 + "\n\n"
+    message = "🚨 <b>Found Top Bounties!</b>\n\n"
     
     inline_keyboard = []
     for idx, b in enumerate(bounties_list, 1):
-        message += f"<b>[{idx}] {b['title']}</b>\nScore: {b['score']}/10\n<a href='{b['url']}'>🔗 View on GitHub</a>\n\n"
-        # Add a button for this specific bounty
-        inline_keyboard.append([{"text": f"✅ Claim Option {idx}", "callback_data": f"CLAIM_{idx}"}])
+        message += f"<b>[{idx}] {b['title']}</b>\nScore: {b['score']}/10 | 💰 {b.get('reward', 'Unknown')}\n<a href='{b['url']}'>🔗 View on GitHub</a>\n\n"
+        # Store the GitHub ID in the button so we can recall it forever
+        inline_keyboard.append([{"text": f"✅ Claim Option {idx}", "callback_data": f"CLAIM_{b['id']}"}])
         
-    # Add the universal skip button
     inline_keyboard.append([{"text": "⏭️ Skip All", "callback_data": "SKIP"}])
     
     payload = {
         "chat_id": TELEGRAM_CHAT_ID, 
         "text": message, 
         "parse_mode": "HTML",
-        "reply_markup": {"inline_keyboard": inline_keyboard}
+        "reply_markup": {"inline_keyboard": inline_keyboard},
+        "disable_notification": is_duplicate # Silent if duplicate!
     }
     requests.post(url, json=payload)
 
-def send_telegram_idle_menu():
-    """Sends the sleep message with a 'Scan Now' button."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID, 
-        "text": "💤 Sleeping for 10 minutes... (Auto-scanning soon)", 
-        "reply_markup": {"inline_keyboard": [[{"text": "🔍 Scan GitHub Now", "callback_data": "SCAN"}]]}
-    }
-    requests.post(url, json=payload)
+def send_telegram_msg(text, silent=False):
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_notification": silent}
+    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
 
 def poll_telegram_for_buttons(timeout_seconds):
-    """Polls Telegram for button clicks. Auto-returns 'TIMEOUT' if time expires."""
     global LAST_UPDATE_ID
     start_time = time.time()
     
     while time.time() - start_time < timeout_seconds:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?timeout=3"
-        # Only fetch new updates we haven't seen yet
         if LAST_UPDATE_ID: url += f"&offset={LAST_UPDATE_ID + 1}"
             
         try:
             res = requests.get(url).json()
             for update in res.get("result", []):
                 LAST_UPDATE_ID = update["update_id"]
-                
-                # Check if a button was clicked
                 if "callback_query" in update:
                     data = update["callback_query"]["data"]
                     if data.startswith("CLAIM_"):
-                        return int(data.split("_")[1])
+                        return data.split("_")[1] # Returns the issue ID
                     elif data == "SKIP":
                         return "SKIP"
-                    elif data == "SCAN":
-                        return "SCAN"
-                        
-                # Check if a text command was typed (fallback)
-                elif "message" in update and "text" in update["message"]:
-                    text = update["message"]["text"].strip().upper()
-                    if text == "/SCAN": return "SCAN"
         except: pass
         time.sleep(2)
-        
     return "TIMEOUT"
 
-def send_telegram_confirmation(text):
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+# ---------------------------------------------------------
+# 5. THE AUTO-COMMENTER (WITH GEMINI)
+# ---------------------------------------------------------
+def execute_claim_protocol(bounty_id):
+    """Handles Advanced Commenting and Auto-Forking."""
+    if bounty_id not in BOUNTY_CACHE:
+        send_telegram_msg("❌ Error: Bounty expired from cache. Cannot claim.")
+        return
 
-def post_github_comment(api_comments_url):
-    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    comment_body = {"body": "/attempt\n\nHi there! I'd love to take this on. I have strong experience with this stack and can start working on a clean, well-tested PR immediately."}
+    bounty = BOUNTY_CACHE[bounty_id]
+    send_telegram_msg("🧠 Gemini is reading the repo and drafting the claim...", silent=True)
     
-    print(f"🚀 Posting official claim to GitHub...")
-    response = requests.post(api_comments_url, headers=headers, json=comment_body)
+    # 1. Draft the intelligent comment
+    comments_text = fetch_issue_comments(bounty["api_comments_url"])
+    smart_comment = generate_advanced_claim(bounty["title"], bounty["body"], comments_text)
+    
+    # 2. Post to GitHub
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    response = requests.post(bounty["api_comments_url"], headers=headers, json={"body": smart_comment})
     
     if response.status_code == 201:
-        return True, "Success"
+        # 3. Auto-Fork the Repository
+        send_telegram_msg(f"✅ `/attempt` posted successfully!\n\n🤖 Cloning repository to your account...", silent=True)
+        fork_success, repo_name = fork_repository(bounty["url"])
+        
+        if fork_success:
+            send_telegram_msg(f"🎯 <b>CLAIM COMPLETE</b>\n\n1. Issue Claimed.\n2. Repo Forked ({repo_name}).\n\nYou are clear to pull and branch.", silent=False)
+        else:
+            send_telegram_msg(f"⚠️ Claimed successfully, but Auto-Fork failed. Please fork manually.", silent=False)
     else:
-        try: error_details = response.json().get('message', response.text)
-        except: error_details = response.text
-        print(f"❌ GitHub API Error: {error_details}")
-        return False, error_details
+        send_telegram_msg(f"❌ Error posting to GitHub: {response.text}")
 
 # ---------------------------------------------------------
-# 5. THE BOT LOOP (Runs in Background)
+# 6. THE BOT LOOP
 # ---------------------------------------------------------
 def run_bounty_hunter():
-    print("🤖 Agent Background Thread Online.")
-    flush_telegram_updates() # Clear old button clicks on startup
+    global PREVIOUS_BOUNTY_IDS
+    print("🤖 V3 Agent Online.")
+    flush_telegram_updates() 
     
     while True:
         bounties = fetch_potential_bounties()
         high_score_bounties = []
+        current_ids = []
         
         if bounties:
             for b in bounties:
                 comments_text = fetch_issue_comments(b["api_comments_url"])
                 verdict = evaluate_bounty(b["title"], b["body"], comments_text)
+                
+                # High standards + Money Filter check
                 if verdict.get("score", 0) >= 7 and verdict.get("is_winnable"):
                     b["score"] = verdict["score"]
-                    b["reason"] = verdict["reason"]
+                    b["reward"] = verdict.get("reward", "Unknown")
                     high_score_bounties.append(b)
+                    current_ids.append(b["id"])
                     
         if high_score_bounties:
-            comparison_text = generate_bounty_comparison(high_score_bounties)
-            send_telegram_menu(high_score_bounties, comparison_text)
+            # Check if these are the exact same bounties we just sent
+            is_duplicate = set(current_ids) == set(PREVIOUS_BOUNTY_IDS)
+            PREVIOUS_BOUNTY_IDS = current_ids
             
-            # Wait for 15 minutes (900 seconds) for you to click a button
-            print("⏳ Waiting 15 minutes for Telegram interaction...")
-            user_choice = poll_telegram_for_buttons(timeout_seconds=900)
+            send_telegram_menu(high_score_bounties, is_duplicate=is_duplicate)
+            
+            # Wait 5 minutes (300 seconds) for interaction
+            print("⏳ Waiting 5 mins for Telegram interaction...")
+            user_choice = poll_telegram_for_buttons(timeout_seconds=300)
             
             if user_choice == "TIMEOUT":
-                send_telegram_confirmation("⏭️ 15 minutes passed with no response. Auto-skipping.")
-                print("⏲️ Auto-skipped due to timeout.")
-            elif user_choice == "SKIP":
-                send_telegram_confirmation("⏭️ Skipped.")
-            elif isinstance(user_choice, int) and user_choice > 0 and user_choice <= len(high_score_bounties):
-                selected = high_score_bounties[user_choice - 1]
-                success, error_msg = post_github_comment(selected["api_comments_url"])
+                send_telegram_msg("⏭️ 5 mins passed. Auto-skipping.", silent=True)
+                print("⏳ Sleeping for 10 minutes before rescan...")
+                time.sleep(600) # Rescan after 10 mins
                 
-                if success:
-                    send_telegram_confirmation(f"✅ Successfully posted `/attempt` on:\n{selected['title']}")
-                else:
-                    send_telegram_confirmation(f"❌ Error posting to GitHub.\n\nReason: {error_msg}")
+            elif user_choice == "SKIP":
+                send_telegram_msg("⏭️ Manual Skip. Entering deep sleep.", silent=True)
+                print("⏳ Sleeping for 15 minutes...")
+                time.sleep(900) # Deep sleep for 15 mins
+                
+            else:
+                # user_choice is the bounty_id from the button!
+                execute_claim_protocol(user_choice)
+                time.sleep(10) # Brief pause after action
         else:
-            print("💤 No high-match bounties found this round.")
-            
-        # The new Active Idle state
-        send_telegram_idle_menu()
-        print("⏳ Entering Active Idle for 10 minutes. Waiting for auto-scan or manual trigger...")
-        idle_choice = poll_telegram_for_buttons(timeout_seconds=600) # Wait up to 10 mins
-        
-        if idle_choice == "SCAN":
-            send_telegram_confirmation("🚀 Manual scan triggered! Checking GitHub now...")
-            print("🔍 Manual scan triggered by user.")
-        # If it returns "TIMEOUT", 10 minutes passed, and the loop naturally restarts!
+            print("💤 No high-match cash bounties found. Sleeping 10 mins...")
+            PREVIOUS_BOUNTY_IDS = []
+            time.sleep(600)
 
 # ---------------------------------------------------------
-# 6. THE WEB SERVER (Keeps Render Awake)
+# 7. WEB SERVER
 # ---------------------------------------------------------
 app = Flask(__name__)
 
