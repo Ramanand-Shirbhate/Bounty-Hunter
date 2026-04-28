@@ -19,12 +19,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 groq_client = Groq(api_key=GROQ_API_KEY)
 MY_SKILLS = "TypeScript, Node.js, React, and basic Python."
 
+# Global tracker for Telegram updates so we don't process the same button click twice
+LAST_UPDATE_ID = None
+
 # ---------------------------------------------------------
 # 2. GITHUB DATA FETCHERS
 # ---------------------------------------------------------
 def fetch_potential_bounties():
     url = "https://api.github.com/search/issues"
-    # Updated to Bearer token
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     query = "is:issue is:open label:bounty no:assignee"
     params = {"q": query, "sort": "created", "order": "desc", "per_page": 5}
@@ -53,7 +55,6 @@ def fetch_potential_bounties():
     return good_bounties
 
 def fetch_issue_comments(comments_url):
-    # Updated to Bearer token
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     response = requests.get(comments_url, headers=headers)
     if response.status_code == 200:
@@ -103,47 +104,87 @@ def generate_bounty_comparison(high_score_bounties):
         return "Comparison failed."
 
 # ---------------------------------------------------------
-# 4. TELEGRAM COMMUNICATION
+# 4. TELEGRAM COMMUNICATION (WITH BUTTONS & TIMEOUTS)
 # ---------------------------------------------------------
-def send_telegram_menu(bounties_list, comparison_text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    message = f"🚨 <b>Found Top Bounties!</b>\n\n🤖 <b>AI Analyst Verdict:</b>\n{comparison_text}\n\n" + "➖"*15 + "\n\n"
-    for idx, b in enumerate(bounties_list, 1):
-        message += f"<b>[{idx}] {b['title']}</b>\nScore: {b['score']}/10\n<a href='{b['url']}'>🔗 View on GitHub</a>\n\n"
-    message += "Reply with <b>CLAIM 1</b> or <b>SKIP</b>"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"})
-
-def wait_for_telegram_command():
-    print("⏳ Waiting for your reply on Telegram...")
+def flush_telegram_updates():
+    """Clears old button clicks so it doesn't trigger on startup."""
+    global LAST_UPDATE_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    last_update_id = None
     try:
-        init_res = requests.get(url).json()
-        if init_res.get("result"): last_update_id = init_res["result"][-1]["update_id"]
+        res = requests.get(url).json()
+        if res.get("result"): LAST_UPDATE_ID = res["result"][-1]["update_id"]
     except: pass
 
-    while True:
+def send_telegram_menu(bounties_list, comparison_text):
+    """Sends the menu with inline 'Claim' and 'Skip' buttons."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    message = f"🚨 <b>Found Top Bounties!</b>\n\n🤖 <b>AI Analyst Verdict:</b>\n{comparison_text}\n\n" + "➖"*15 + "\n\n"
+    
+    inline_keyboard = []
+    for idx, b in enumerate(bounties_list, 1):
+        message += f"<b>[{idx}] {b['title']}</b>\nScore: {b['score']}/10\n<a href='{b['url']}'>🔗 View on GitHub</a>\n\n"
+        # Add a button for this specific bounty
+        inline_keyboard.append([{"text": f"✅ Claim Option {idx}", "callback_data": f"CLAIM_{idx}"}])
+        
+    # Add the universal skip button
+    inline_keyboard.append([{"text": "⏭️ Skip All", "callback_data": "SKIP"}])
+    
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID, 
+        "text": message, 
+        "parse_mode": "HTML",
+        "reply_markup": {"inline_keyboard": inline_keyboard}
+    }
+    requests.post(url, json=payload)
+
+def send_telegram_idle_menu():
+    """Sends the sleep message with a 'Scan Now' button."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID, 
+        "text": "💤 Sleeping for 10 minutes... (Auto-scanning soon)", 
+        "reply_markup": {"inline_keyboard": [[{"text": "🔍 Scan GitHub Now", "callback_data": "SCAN"}]]}
+    }
+    requests.post(url, json=payload)
+
+def poll_telegram_for_buttons(timeout_seconds):
+    """Polls Telegram for button clicks. Auto-returns 'TIMEOUT' if time expires."""
+    global LAST_UPDATE_ID
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout_seconds:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?timeout=3"
+        # Only fetch new updates we haven't seen yet
+        if LAST_UPDATE_ID: url += f"&offset={LAST_UPDATE_ID + 1}"
+            
         try:
             res = requests.get(url).json()
-            results = res.get("result", [])
-            if results:
-                latest_update = results[-1]
-                update_id = latest_update["update_id"]
-                if last_update_id is None or update_id > last_update_id:
-                    text = latest_update.get("message", {}).get("text", "").strip().upper()
-                    if text.startswith("CLAIM"):
-                        try: return int(text.split(" ")[1])
-                        except: pass
-                    elif text == "SKIP": return 0
-                    last_update_id = update_id 
+            for update in res.get("result", []):
+                LAST_UPDATE_ID = update["update_id"]
+                
+                # Check if a button was clicked
+                if "callback_query" in update:
+                    data = update["callback_query"]["data"]
+                    if data.startswith("CLAIM_"):
+                        return int(data.split("_")[1])
+                    elif data == "SKIP":
+                        return "SKIP"
+                    elif data == "SCAN":
+                        return "SCAN"
+                        
+                # Check if a text command was typed (fallback)
+                elif "message" in update and "text" in update["message"]:
+                    text = update["message"]["text"].strip().upper()
+                    if text == "/SCAN": return "SCAN"
         except: pass
-        time.sleep(3)
+        time.sleep(2)
+        
+    return "TIMEOUT"
 
 def send_telegram_confirmation(text):
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
 
 def post_github_comment(api_comments_url):
-    # Updated to Bearer token
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     comment_body = {"body": "/attempt\n\nHi there! I'd love to take this on. I have strong experience with this stack and can start working on a clean, well-tested PR immediately."}
     
@@ -153,11 +194,8 @@ def post_github_comment(api_comments_url):
     if response.status_code == 201:
         return True, "Success"
     else:
-        # Extract the exact error message to send back to Telegram
-        try:
-            error_details = response.json().get('message', response.text)
-        except:
-            error_details = response.text
+        try: error_details = response.json().get('message', response.text)
+        except: error_details = response.text
         print(f"❌ GitHub API Error: {error_details}")
         return False, error_details
 
@@ -166,6 +204,8 @@ def post_github_comment(api_comments_url):
 # ---------------------------------------------------------
 def run_bounty_hunter():
     print("🤖 Agent Background Thread Online.")
+    flush_telegram_updates() # Clear old button clicks on startup
+    
     while True:
         bounties = fetch_potential_bounties()
         high_score_bounties = []
@@ -182,26 +222,36 @@ def run_bounty_hunter():
         if high_score_bounties:
             comparison_text = generate_bounty_comparison(high_score_bounties)
             send_telegram_menu(high_score_bounties, comparison_text)
-            user_choice = wait_for_telegram_command()
             
-            if user_choice > 0 and user_choice <= len(high_score_bounties):
+            # Wait for 15 minutes (900 seconds) for you to click a button
+            print("⏳ Waiting 15 minutes for Telegram interaction...")
+            user_choice = poll_telegram_for_buttons(timeout_seconds=900)
+            
+            if user_choice == "TIMEOUT":
+                send_telegram_confirmation("⏭️ 15 minutes passed with no response. Auto-skipping.")
+                print("⏲️ Auto-skipped due to timeout.")
+            elif user_choice == "SKIP":
+                send_telegram_confirmation("⏭️ Skipped.")
+            elif isinstance(user_choice, int) and user_choice > 0 and user_choice <= len(high_score_bounties):
                 selected = high_score_bounties[user_choice - 1]
-                
-                # Capture both success status and the error message
                 success, error_msg = post_github_comment(selected["api_comments_url"])
                 
                 if success:
                     send_telegram_confirmation(f"✅ Successfully posted `/attempt` on:\n{selected['title']}")
                 else:
-                    # Send the exact GitHub error directly to your phone
                     send_telegram_confirmation(f"❌ Error posting to GitHub.\n\nReason: {error_msg}")
-            else:
-                send_telegram_confirmation("⏭️ Skipped.")
         else:
             print("💤 No high-match bounties found this round.")
             
-        print("⏳ Sleeping for 10 minutes...")
-        time.sleep(600)
+        # The new Active Idle state
+        send_telegram_idle_menu()
+        print("⏳ Entering Active Idle for 10 minutes. Waiting for auto-scan or manual trigger...")
+        idle_choice = poll_telegram_for_buttons(timeout_seconds=600) # Wait up to 10 mins
+        
+        if idle_choice == "SCAN":
+            send_telegram_confirmation("🚀 Manual scan triggered! Checking GitHub now...")
+            print("🔍 Manual scan triggered by user.")
+        # If it returns "TIMEOUT", 10 minutes passed, and the loop naturally restarts!
 
 # ---------------------------------------------------------
 # 6. THE WEB SERVER (Keeps Render Awake)
@@ -213,10 +263,8 @@ def home():
     return "🤖 Algora Bounty Hunter is ALIVE and running!"
 
 if __name__ == "__main__":
-    # Start the bounty hunter in a separate background thread
     hunter_thread = threading.Thread(target=run_bounty_hunter, daemon=True)
     hunter_thread.start()
     
-    # Start the web server to listen for Render/Pings
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
