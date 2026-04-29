@@ -33,7 +33,6 @@ BOUNTY_CACHE = {}
 # HELPER: HTML SANITIZER
 # ---------------------------------------------------------
 def escape_html(text):
-    """Prevents Telegram from crashing when titles or AI reasons contain <, >, or &."""
     if not text: return "N/A"
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -164,21 +163,21 @@ def send_telegram_menu(bounties_list, comparison_text, show_deep_scan=True):
         inline_keyboard.append([{"text": f"✅ Claim Option {idx}", "callback_data": f"CLAIM_{b['id']}"}])
         
     if show_deep_scan:
-        inline_keyboard.append([{"text": "☢️ Deep Scan (Show All 0-10)", "callback_data": "DEEP_SCAN"}])
+        inline_keyboard.append([{"text": "☢️ Deep Scan (Show All)", "callback_data": "DEEP_SCAN"}])
         
     inline_keyboard.append([{"text": "⏭️ Skip All", "callback_data": "SKIP"}])
     
     payload = {
         "chat_id": TELEGRAM_CHAT_ID, 
         "text": message, 
-        "parse_mode": "HTML"
-        # FIX: We completely omit 'disable_notification' here. This forces Telegram to ring loudly.
+        "parse_mode": "HTML",
+        "reply_markup": {"inline_keyboard": inline_keyboard},
+        "disable_web_page_preview": True # <-- CRITICAL FIX: Removes the massive GitHub box to fix Telegram UI glitch
     }
     
     response = requests.post(url, json=payload)
     if response.status_code != 200:
-        print(f"❌ Telegram API Error: {response.text}")
-        send_telegram_msg("❌ Failed to display menu. A bounty title or AI reason contained unsupported characters.", silent=False)
+        send_telegram_msg("❌ Failed to display menu due to unsupported characters.", silent=False)
         return False 
     return True
 
@@ -187,23 +186,15 @@ def send_telegram_idle_menu(sleep_time_mins):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID, 
         "text": f"<i>💤 Sleeping for {sleep_time_mins} minutes...</i>", 
-        "parse_mode": "HTML", # FIX: Added HTML parsing here so <i> works
+        "parse_mode": "HTML",
         "reply_markup": {"inline_keyboard": [[{"text": "🔍 Scan GitHub Now", "callback_data": "SCAN"}]]},
         "disable_notification": True 
     }
     requests.post(url, json=payload)
 
 def send_telegram_msg(text, silent=False):
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID, 
-        "text": text, 
-        "parse_mode": "HTML" # FIX: Added HTML parsing so your custom <i> tags work perfectly!
-    }
-    
-    # Only add the silent flag if we specifically ask for it. Otherwise, it defaults to LOUD.
-    if silent:
-        payload["disable_notification"] = True
-        
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    if silent: payload["disable_notification"] = True
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
 
 def poll_telegram_for_buttons(timeout_seconds):
@@ -219,22 +210,18 @@ def poll_telegram_for_buttons(timeout_seconds):
             for update in res.get("result", []):
                 LAST_UPDATE_ID = update["update_id"]
                 
-                # Check for Button Clicks
                 if "callback_query" in update:
                     cb_id = update["callback_query"]["id"]
                     data = update["callback_query"]["data"]
                     requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery?callback_query_id={cb_id}")
                     
                     if data.startswith("CLAIM_"): return data.split("_")[1] 
-                    elif data == "SKIP": return "SKIP"
-                    elif data == "SCAN": return "SCAN"
-                    elif data == "DEEP_SCAN": return "DEEP_SCAN"
+                    elif data in ["SKIP", "SCAN", "DEEP_SCAN"]: return data
                     
-                # Check for Text Commands (like /start)
                 elif "message" in update and "text" in update["message"]:
                     text = update["message"]["text"].strip().upper()
-                    if text in ["/START", "/SCAN"]:
-                        return "SCAN"
+                    if text == "/START": return "RESET"
+                    elif text == "/SCAN": return "SCAN"
         except Exception: pass
         time.sleep(2)
     return "TIMEOUT"
@@ -249,7 +236,7 @@ def execute_claim_protocol(bounty_id):
 
     bounty = BOUNTY_CACHE[bounty_id]
     send_telegram_msg("<i>⏳ Claim sequence initiated...</i>", silent=True)
-    send_telegram_msg("🧠 Gemini is reading the repo and drafting the claim...", silent=True)
+    send_telegram_msg("<i>🧠 Gemini is reading the repo and drafting the claim...</i>", silent=True)
     
     comments_text = fetch_issue_comments(bounty["api_comments_url"])
     smart_comment = generate_advanced_claim(bounty["title"], bounty["body"], comments_text)
@@ -258,7 +245,7 @@ def execute_claim_protocol(bounty_id):
     response = requests.post(bounty["api_comments_url"], headers=headers, json={"body": smart_comment})
     
     if response.status_code == 201:
-        send_telegram_msg(f"✅ `/attempt` posted successfully!\n\n🤖 Cloning repository to your account...", silent=True)
+        send_telegram_msg("<i>✅ `/attempt` posted successfully!\n\n🤖 Cloning repository to your account...</i>", silent=True)
         fork_success, repo_name = fork_repository(bounty["url"])
         if fork_success:
             send_telegram_msg(f"🎯 <b>CLAIM COMPLETE</b>\n\n1. Issue Claimed.\n2. Repo Forked ({repo_name}).\n\nYou are clear to pull and branch.", silent=False)
@@ -271,8 +258,8 @@ def execute_claim_protocol(bounty_id):
 # 6. THE BOT LOOP
 # ---------------------------------------------------------
 def run_bounty_hunter():
-    global PREVIOUS_BOUNTY_IDS
-    print("🤖 V3.5 Agent Online. Notifications and HTML parsing fixed.")
+    global PREVIOUS_BOUNTY_IDS, BOUNTY_CACHE
+    print("🤖 V3.7 Agent Online. Link Previews Disabled for UI Stability.")
     flush_telegram_updates() 
     
     force_scan = False
@@ -300,30 +287,26 @@ def run_bounty_hunter():
                     
         if display_bounties:
             if not force_scan and not deep_scan and set(current_ids) == set(PREVIOUS_BOUNTY_IDS):
-                print("💤 Duplicate bounties found. Going directly to Active Idle.")
+                print("💤 Duplicate bounties found.")
                 bounties_found = False 
+                if force_scan: 
+                    send_telegram_msg("<i>📉 Scan complete: No NEW bounties found since last check.</i>", silent=True)
             else:
                 if not deep_scan: PREVIOUS_BOUNTY_IDS = current_ids
-                
                 comp_text = "☢️ Deep Scan Active: Showing all unfiltered results." if deep_scan else "Only high-match bounties shown."
-                
-                # Check if Telegram accepted the message!
                 menu_sent = send_telegram_menu(display_bounties, comparison_text=comp_text, show_deep_scan=not deep_scan) 
-                
-                if menu_sent:
-                    bounties_found = True
-                else:
-                    bounties_found = False 
+                bounties_found = menu_sent
         else:
             bounties_found = False
             if not deep_scan: PREVIOUS_BOUNTY_IDS = []
+            if force_scan or deep_scan:
+                send_telegram_msg("<i>📉 Scan complete: No bounties passed the USD & Score filters right now.</i>", silent=True)
                 
         force_scan = False
         deep_scan = False
         
         # --- DECISION PHASE ---
         if bounties_found:
-            print("⏳ Waiting 5 mins for Telegram interaction...")
             user_choice = poll_telegram_for_buttons(timeout_seconds=300)
             
             if user_choice == "TIMEOUT":
@@ -333,12 +316,18 @@ def run_bounty_hunter():
                 send_telegram_msg("<i>⏭️ Manual Skip. Entering deep sleep.</i>", silent=True)
                 sleep_mins = 15
             elif user_choice == "SCAN":
-                send_telegram_msg("<i>🚀 Forced scan triggered!</i>", silent=True)
+                send_telegram_msg("<i>🔍 Scanning GitHub and evaluating bounties... Please wait.</i>", silent=True)
                 force_scan = True
                 continue
             elif user_choice == "DEEP_SCAN":
-                send_telegram_msg("<i>☢️ Deep Scan initialized! Bypassing all AI filters...</i>", silent=True)
+                send_telegram_msg("<i>☢️ Deep Scan initialized! Evaluating 10 issues...</i>", silent=True)
                 deep_scan = True
+                continue
+            elif user_choice == "RESET":
+                PREVIOUS_BOUNTY_IDS = []
+                BOUNTY_CACHE.clear()
+                send_telegram_msg("<i>🔄 System Reset Triggered via /start. Cache cleared! Scanning now...</i>", silent=True)
+                force_scan = True
                 continue
             else:
                 execute_claim_protocol(user_choice)
@@ -346,18 +335,22 @@ def run_bounty_hunter():
                 sleep_mins = 10 
         else:
             sleep_mins = 10
-            print(f"💤 Sleeping for {sleep_mins} mins...")
 
         # --- ACTIVE IDLE PHASE ---
         send_telegram_idle_menu(sleep_mins)
         idle_choice = poll_telegram_for_buttons(timeout_seconds=(sleep_mins * 60))
         
         if idle_choice == "SCAN":
-            send_telegram_msg("<i>🚀 Manual scan triggered! Checking GitHub now...</i>", silent=True)
+            send_telegram_msg("<i>🔍 Scanning GitHub and evaluating bounties... Please wait.</i>", silent=True)
             force_scan = True
         elif idle_choice == "DEEP_SCAN":
-            send_telegram_msg("<i>☢️ Deep Scan triggered! Checking GitHub now...</i>", silent=True)
+            send_telegram_msg("<i>☢️ Deep Scan initialized! Evaluating 10 issues...</i>", silent=True)
             deep_scan = True
+        elif idle_choice == "RESET":
+            PREVIOUS_BOUNTY_IDS = []
+            BOUNTY_CACHE.clear()
+            send_telegram_msg("<i>🔄 System Reset Triggered via /start. Cache cleared! Scanning now...</i>", silent=True)
+            force_scan = True
 
 # ---------------------------------------------------------
 # 7. WEB SERVER
