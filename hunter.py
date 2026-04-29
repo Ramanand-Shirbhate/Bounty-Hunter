@@ -93,21 +93,21 @@ def fork_repository(html_url):
 # 3. AI ENGINES (GROQ & GEMINI)
 # ---------------------------------------------------------
 def evaluate_bounty(title, body, comments_text):
-    """Groq Evaluator: Now strict on Fiat/USD Money."""
+    """Groq Evaluator: Now strictly enforces FIAT money rules."""
     system_prompt = f"""
-    You evaluate bounties. Tech stack: {MY_SKILLS}.
-    1. Read the issue and comments. If claimed, set is_winnable: false.
-    2. CHECK THE REWARD: Look for USD, USDC, or Fiat amounts (e.g. $100). 
-       If the reward is in a random altcoin (RTC, tokens) or missing, set is_winnable: false.
+    You are an expert senior developer evaluating open-source bounties. My tech stack is: {MY_SKILLS}.
+    1. Read the issue and comments. If claimed, set is_winnable to false.
+    2. STRICT FIAT MONEY FILTER: The reward MUST be in real USD (e.g., $100, $50). 
+       If the reward mentions 'RTC', altcoins, tokens, or lacks a literal '$' sign, YOU MUST SET is_winnable TO false. Do not calculate exchange rates.
     
-    Return ONLY JSON:
+    Return ONLY a valid JSON object:
     {{"score": <int 1-10>, "is_winnable": <bool>, "reward": "<Extract the $ amount>", "reason": "<Short sentence>"}}
     """
     try:
         completion = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"TITLE: {title}\n\nBODY:\n{body}\n\nCOMMENTS:\n{comments_text}"}],
-            temperature=0.1,
+            temperature=0.0, # 0.0 prevents AI hallucinations
             response_format={"type": "json_object"}
         )
         return json.loads(completion.choices[0].message.content)
@@ -144,8 +144,8 @@ def flush_telegram_updates():
         if res.get("result"): LAST_UPDATE_ID = res["result"][-1]["update_id"]
     except: pass
 
-def send_telegram_menu(bounties_list, is_duplicate=False):
-    """Sends menu. Uses silent notification if we've seen these bounties recently."""
+def send_telegram_menu(bounties_list):
+    """Sends the interactive menu to your phone."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     message = "🚨 <b>Found Top Bounties!</b>\n\n"
     
@@ -161,8 +161,7 @@ def send_telegram_menu(bounties_list, is_duplicate=False):
         "chat_id": TELEGRAM_CHAT_ID, 
         "text": message, 
         "parse_mode": "HTML",
-        "reply_markup": {"inline_keyboard": inline_keyboard},
-        "disable_notification": is_duplicate # Silent if duplicate!
+        "reply_markup": {"inline_keyboard": inline_keyboard}
     }
     requests.post(url, json=payload)
 
@@ -229,7 +228,7 @@ def execute_claim_protocol(bounty_id):
 # ---------------------------------------------------------
 def run_bounty_hunter():
     global PREVIOUS_BOUNTY_IDS
-    print("🤖 V3 Agent Online.")
+    print("🤖 V3.1 Agent Online. Anti-Spam active.")
     flush_telegram_updates() 
     
     while True:
@@ -250,11 +249,16 @@ def run_bounty_hunter():
                     current_ids.append(b["id"])
                     
         if high_score_bounties:
-            # Check if these are the exact same bounties we just sent
-            is_duplicate = set(current_ids) == set(PREVIOUS_BOUNTY_IDS)
+            # 🛑 THE ANTI-SPAM FIX: Check for duplicates BEFORE doing anything
+            if set(current_ids) == set(PREVIOUS_BOUNTY_IDS):
+                print("💤 Bounties are identical to the last scan. Sleeping silently to prevent Telegram spam.")
+                time.sleep(600) # Sleep 10 mins and check again
+                continue # Skips the rest of the loop!
+                
+            # If we made it here, these are brand new bounties!
             PREVIOUS_BOUNTY_IDS = current_ids
             
-            send_telegram_menu(high_score_bounties, is_duplicate=is_duplicate)
+            send_telegram_menu(high_score_bounties)
             
             # Wait 5 minutes (300 seconds) for interaction
             print("⏳ Waiting 5 mins for Telegram interaction...")
