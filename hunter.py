@@ -8,7 +8,7 @@ from groq import Groq
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# ---------------------------------------------------------
+# --------------------------------------------------------- 
 # 1. SETUP & CREDENTIALS
 # ---------------------------------------------------------
 load_dotenv()
