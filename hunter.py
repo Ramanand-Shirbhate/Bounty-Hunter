@@ -3,6 +3,7 @@ import json
 import time
 import threading
 import requests
+import html
 from flask import Flask
 from groq import Groq
 import google.generativeai as genai
@@ -33,13 +34,12 @@ BOUNTY_CACHE = {}
 # 2. GITHUB DATA FETCHERS & ACTIONS
 # ---------------------------------------------------------
 def fetch_potential_bounties(limit=5):
-    """Fetches bounties. Limit increases during Deep Scans."""
     url = "https://api.github.com/search/issues"
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     query = "is:issue is:open label:bounty no:assignee"
     params = {"q": query, "sort": "created", "order": "desc", "per_page": limit}
     
-    print(f"\n🔍 Scouting GitHub for {limit} fresh bounties...")
+    print(f"\n🔍 Scouting GitHub for {limit} bounties...")
     response = requests.get(url, headers=headers, params=params)
     if response.status_code != 200:
         return []
@@ -131,7 +131,7 @@ def generate_advanced_claim(title, body, comments):
         return "/attempt\n\nHi there! I have strong experience with this stack and would love to take this on. I will begin setting up my environment and auditing the required modules immediately."
 
 # ---------------------------------------------------------
-# 4. TELEGRAM COMMUNICATION 
+# 4. TELEGRAM UI & MESSAGE EDITING
 # ---------------------------------------------------------
 def flush_telegram_updates():
     global LAST_UPDATE_ID
@@ -142,14 +142,18 @@ def flush_telegram_updates():
     except: pass
 
 def send_telegram_menu(bounties_list, comparison_text, show_deep_scan=True):
-    """Sends the interactive menu. Includes AI Reasoning so you see why scores are low during Deep Scans."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     message = f"🚨 <b>Found Bounties!</b>\n\n🤖 <b>Analyst Verdict:</b>\n<i>{comparison_text}</i>\n\n" + "➖"*15 + "\n\n"
     
     inline_keyboard = []
     for idx, b in enumerate(bounties_list, 1):
-        message += f"<b>[{idx}] {b['title']}</b>\nScore: {b['score']}/10 | 💰 {b.get('reward', 'Unknown')}\n"
-        message += f"<i>Reason: {b.get('reason', 'N/A')}</i>\n" # Added so you can see why it failed
+        # PROTECT AGAINST HTML PARSING ERRORS (The Deep Scan Bug Fix)
+        safe_title = html.escape(b['title'])
+        safe_reason = html.escape(b.get('reason', 'N/A'))
+        safe_reward = html.escape(b.get('reward', 'Unknown'))
+        
+        message += f"<b>[{idx}] {safe_title}</b>\nScore: {b['score']}/10 | 💰 {safe_reward}\n"
+        message += f"<i>Reason: {safe_reason}</i>\n"
         message += f"<a href='{b['url']}'>🔗 View on GitHub</a>\n\n"
         
         inline_keyboard.append([{"text": f"✅ Claim Option {idx}", "callback_data": f"CLAIM_{b['id']}"}])
@@ -163,20 +167,45 @@ def send_telegram_menu(bounties_list, comparison_text, show_deep_scan=True):
         "chat_id": TELEGRAM_CHAT_ID, 
         "text": message, 
         "parse_mode": "HTML",
-        "reply_markup": {"inline_keyboard": inline_keyboard},
-        "disable_notification": False # FORCE LOUD NOTIFICATION
+        "reply_markup": {"inline_keyboard": inline_keyboard}
+    }
+    res = requests.post(url, json=payload).json()
+    if res.get("ok"): return res["result"]["message_id"] # Return ID so we can edit it later
+    return None
+
+def edit_telegram_message(message_id, new_text):
+    """Edits an existing message and strips the buttons away."""
+    if not message_id: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "message_id": message_id,
+        "text": new_text,
+        "parse_mode": "HTML"
     }
     requests.post(url, json=payload)
+
+def delete_telegram_message(message_id):
+    """Deletes a message entirely (used to clean up the 'Sleeping' messages)."""
+    if not message_id: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id})
 
 def send_telegram_idle_menu(sleep_time_mins):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID, 
-        "text": f"💤 Sleeping for {sleep_time_mins} minutes...", 
-        "reply_markup": {"inline_keyboard": [[{"text": "🔍 Scan GitHub Now", "callback_data": "SCAN"}]]},
-        "disable_notification": True # FORCE SILENT
+        "text": f"💤 <i>Sleeping for {sleep_time_mins} minutes...</i>", 
+        "parse_mode": "HTML",
+        "reply_markup": {"inline_keyboard": [
+            [{"text": "🔍 Scan GitHub Now", "callback_data": "SCAN"}],
+            [{"text": "☢️ Deep Scan (Bypass Filters)", "callback_data": "DEEP_SCAN"}]
+        ]},
+        "disable_notification": True
     }
-    requests.post(url, json=payload)
+    res = requests.post(url, json=payload).json()
+    if res.get("ok"): return res["result"]["message_id"]
+    return None
 
 def send_telegram_msg(text, silent=False):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_notification": silent}
@@ -199,7 +228,6 @@ def poll_telegram_for_buttons(timeout_seconds):
                     cb_id = update["callback_query"]["id"]
                     data = update["callback_query"]["data"]
                     
-                    # Stop the Telegram loading spinner
                     requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery?callback_query_id={cb_id}")
                     
                     if data.startswith("CLAIM_"): return data.split("_")[1] 
@@ -245,19 +273,19 @@ def execute_claim_protocol(bounty_id):
 # ---------------------------------------------------------
 def run_bounty_hunter():
     global PREVIOUS_BOUNTY_IDS
-    print("🤖 V3.3 Agent Online. Deep Scan Features Active.")
+    print("🤖 V3.4 Agent Online. Clean UI Active.")
     flush_telegram_updates() 
     
     force_scan = False
     deep_scan = False
     
     while True:
-        # Deep Scan pulls 10 items, normal scan pulls 5
         fetch_limit = 10 if deep_scan else 5
         bounties = fetch_potential_bounties(limit=fetch_limit)
         
         display_bounties = []
         current_ids = []
+        menu_msg_id = None
         
         if bounties:
             for b in bounties:
@@ -268,72 +296,68 @@ def run_bounty_hunter():
                 b["reward"] = verdict.get("reward", "Unknown")
                 b["reason"] = verdict.get("reason", "N/A")
                 
-                # If Deep Scan is true, ignore the filters and append EVERYTHING!
                 if deep_scan or (b["score"] >= 7 and verdict.get("is_winnable")):
                     display_bounties.append(b)
                     current_ids.append(b["id"])
                     
         if display_bounties:
-            # ANTI-SPAM: Bypass if user clicked 'Scan' or 'Deep Scan'
             if not force_scan and not deep_scan and set(current_ids) == set(PREVIOUS_BOUNTY_IDS):
-                print("💤 Duplicate bounties found. Going directly to Active Idle.")
+                print("💤 Duplicate bounties found. Skipping Telegram menu.")
                 bounties_found = False 
             else:
-                # Don't let Deep Scan results overwrite our clean cache
                 if not deep_scan:
                     PREVIOUS_BOUNTY_IDS = current_ids
                 
                 comp_text = "☢️ Deep Scan Active: Showing all unfiltered results." if deep_scan else "Only high-match bounties shown."
-                # Send the menu! Hide the deep scan button if we are already doing one.
-                send_telegram_menu(display_bounties, comparison_text=comp_text, show_deep_scan=not deep_scan) 
+                menu_msg_id = send_telegram_menu(display_bounties, comparison_text=comp_text, show_deep_scan=not deep_scan) 
                 bounties_found = True
         else:
             bounties_found = False
             if not deep_scan:
                 PREVIOUS_BOUNTY_IDS = []
                 
-        # Reset the manual flags for the next loop
         force_scan = False
         deep_scan = False
         
-        # --- THE DECISION & WAITING PHASE ---
+        # --- THE DECISION PHASE ---
         if bounties_found:
             print("⏳ Waiting 5 mins for Telegram interaction...")
             user_choice = poll_telegram_for_buttons(timeout_seconds=300)
             
+            # The Clean UI Update: Editing the menu instead of sending a new text!
             if user_choice == "TIMEOUT":
-                send_telegram_msg("⏭️ 5 mins passed. Auto-skipping.", silent=True)
+                edit_telegram_message(menu_msg_id, "<i>⏲️ Menu expired after 5 minutes. Auto-skipped.</i>")
                 sleep_mins = 10
             elif user_choice == "SKIP":
-                send_telegram_msg("⏭️ Manual Skip. Entering deep sleep.", silent=True)
+                edit_telegram_message(menu_msg_id, "<i>⏭️ Bounties skipped manually.</i>")
                 sleep_mins = 15
             elif user_choice == "SCAN":
-                send_telegram_msg("🚀 Forced scan triggered!", silent=True)
+                edit_telegram_message(menu_msg_id, "<i>🚀 Forced scan triggered. Refreshing...</i>")
                 force_scan = True
                 continue
             elif user_choice == "DEEP_SCAN":
-                send_telegram_msg("☢️ Deep Scan initialized! Bypassing all AI filters...", silent=True)
+                edit_telegram_message(menu_msg_id, "<i>☢️ Deep Scan initialized! Fetching unfiltered results...</i>")
                 deep_scan = True
                 continue
             else:
+                edit_telegram_message(menu_msg_id, f"<i>⏳ Claiming Option...</i>")
                 execute_claim_protocol(user_choice)
                 time.sleep(5) 
                 sleep_mins = 10 
         else:
             sleep_mins = 10
-            print(f"💤 Sleeping for {sleep_mins} mins...")
 
         # --- THE ACTIVE IDLE PHASE ---
-        send_telegram_idle_menu(sleep_mins)
+        idle_msg_id = send_telegram_idle_menu(sleep_mins)
         idle_choice = poll_telegram_for_buttons(timeout_seconds=(sleep_mins * 60))
         
+        # Clean UI: Delete the "Sleeping" message once we wake up
+        delete_telegram_message(idle_msg_id)
+        
         if idle_choice == "SCAN":
-            send_telegram_msg("🚀 Manual scan triggered! Checking GitHub now...", silent=True)
             force_scan = True
         elif idle_choice == "DEEP_SCAN":
-            send_telegram_msg("☢️ Deep Scan triggered! Checking GitHub now...", silent=True)
             deep_scan = True
-        # If TIMEOUT, it just naturally loops back!
 
 # ---------------------------------------------------------
 # 7. WEB SERVER
