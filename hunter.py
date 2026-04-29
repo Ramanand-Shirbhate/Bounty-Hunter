@@ -8,7 +8,7 @@ from groq import Groq
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# --------------------------------------------------------- 
+# ---------------------------------------------------------
 # 1. SETUP & CREDENTIALS
 # ---------------------------------------------------------
 load_dotenv()
@@ -26,8 +26,8 @@ MY_SKILLS = "TypeScript, Node.js, React, and basic Python."
 
 # Global State Management
 LAST_UPDATE_ID = None
-PREVIOUS_BOUNTY_IDS = []  # Used to check for duplicates (Silent Msgs)
-BOUNTY_CACHE = {}         # Stores bounties so old Telegram buttons still work
+PREVIOUS_BOUNTY_IDS = []  
+BOUNTY_CACHE = {}         
 
 # ---------------------------------------------------------
 # 2. GITHUB DATA FETCHERS & ACTIONS
@@ -53,14 +53,14 @@ def fetch_potential_bounties():
             continue 
             
         bounty = {
-            "id": str(issue["id"]), # Unique ID for the cache
+            "id": str(issue["id"]), 
             "title": issue["title"],
             "url": issue["html_url"],
             "api_comments_url": issue["comments_url"], 
             "body": str(issue["body"])[:2000]
         }
         good_bounties.append(bounty)
-        BOUNTY_CACHE[bounty["id"]] = bounty # Save to memory for old buttons
+        BOUNTY_CACHE[bounty["id"]] = bounty 
         
     return good_bounties
 
@@ -75,7 +75,6 @@ def fetch_issue_comments(comments_url):
     return "Could not fetch comments."
 
 def fork_repository(html_url):
-    """Phase 2 Setup: Automatically forks the repo to your account."""
     try:
         parts = html_url.split('/')
         owner, repo = parts[3], parts[4]
@@ -93,12 +92,11 @@ def fork_repository(html_url):
 # 3. AI ENGINES (GROQ & GEMINI)
 # ---------------------------------------------------------
 def evaluate_bounty(title, body, comments_text):
-    """Groq Evaluator: Now strictly enforces FIAT money rules."""
     system_prompt = f"""
     You are an expert senior developer evaluating open-source bounties. My tech stack is: {MY_SKILLS}.
     1. Read the issue and comments. If claimed, set is_winnable to false.
     2. STRICT FIAT MONEY FILTER: The reward MUST be in real USD (e.g., $100, $50). 
-       If the reward mentions 'RTC', altcoins, tokens, or lacks a literal '$' sign, YOU MUST SET is_winnable TO false. Do not calculate exchange rates.
+       If the reward mentions 'RTC', altcoins, tokens, or lacks a literal '$' sign, YOU MUST SET is_winnable TO false.
     
     Return ONLY a valid JSON object:
     {{"score": <int 1-10>, "is_winnable": <bool>, "reward": "<Extract the $ amount>", "reason": "<Short sentence>"}}
@@ -107,7 +105,7 @@ def evaluate_bounty(title, body, comments_text):
         completion = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"TITLE: {title}\n\nBODY:\n{body}\n\nCOMMENTS:\n{comments_text}"}],
-            temperature=0.0, # 0.0 prevents AI hallucinations
+            temperature=0.0, 
             response_format={"type": "json_object"}
         )
         return json.loads(completion.choices[0].message.content)
@@ -115,7 +113,6 @@ def evaluate_bounty(title, body, comments_text):
         return {"score": 0, "is_winnable": False, "reward": "Unknown", "reason": "API Error"}
 
 def generate_advanced_claim(title, body, comments):
-    """Gemini AI: Generates a contextual, intelligent claim comment."""
     prompt = f"""
     I want to claim this GitHub bounty. Write a highly professional comment to post.
     Start with exactly "/attempt".
@@ -134,7 +131,7 @@ def generate_advanced_claim(title, body, comments):
         return "/attempt\n\nHi there! I have strong experience with this stack and would love to take this on. I will begin setting up my environment and auditing the required modules immediately."
 
 # ---------------------------------------------------------
-# 4. TELEGRAM COMMUNICATION (SILENT NOTIFICATIONS)
+# 4. TELEGRAM COMMUNICATION (WITH BUTTON FIXES)
 # ---------------------------------------------------------
 def flush_telegram_updates():
     global LAST_UPDATE_ID
@@ -145,14 +142,13 @@ def flush_telegram_updates():
     except: pass
 
 def send_telegram_menu(bounties_list):
-    """Sends the interactive menu to your phone."""
+    """Sends the interactive menu LOUDLY so you know there's money."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     message = "🚨 <b>Found Top Bounties!</b>\n\n"
     
     inline_keyboard = []
     for idx, b in enumerate(bounties_list, 1):
         message += f"<b>[{idx}] {b['title']}</b>\nScore: {b['score']}/10 | 💰 {b.get('reward', 'Unknown')}\n<a href='{b['url']}'>🔗 View on GitHub</a>\n\n"
-        # Store the GitHub ID in the button so we can recall it forever
         inline_keyboard.append([{"text": f"✅ Claim Option {idx}", "callback_data": f"CLAIM_{b['id']}"}])
         
     inline_keyboard.append([{"text": "⏭️ Skip All", "callback_data": "SKIP"}])
@@ -161,7 +157,19 @@ def send_telegram_menu(bounties_list):
         "chat_id": TELEGRAM_CHAT_ID, 
         "text": message, 
         "parse_mode": "HTML",
-        "reply_markup": {"inline_keyboard": inline_keyboard}
+        "reply_markup": {"inline_keyboard": inline_keyboard},
+        "disable_notification": False # FORCE LOUD NOTIFICATION
+    }
+    requests.post(url, json=payload)
+
+def send_telegram_idle_menu(sleep_time_mins):
+    """Sends the Scan button SILENTLY so it doesn't bother you while waiting."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID, 
+        "text": f"💤 Sleeping for {sleep_time_mins} minutes... (Auto-scanning soon)", 
+        "reply_markup": {"inline_keyboard": [[{"text": "🔍 Scan GitHub Now", "callback_data": "SCAN"}]]},
+        "disable_notification": True # FORCE SILENT
     }
     requests.post(url, json=payload)
 
@@ -170,6 +178,7 @@ def send_telegram_msg(text, silent=False):
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
 
 def poll_telegram_for_buttons(timeout_seconds):
+    """Listens for button clicks and officially 'Answers' them to prevent freezing."""
     global LAST_UPDATE_ID
     start_time = time.time()
     
@@ -181,38 +190,44 @@ def poll_telegram_for_buttons(timeout_seconds):
             res = requests.get(url).json()
             for update in res.get("result", []):
                 LAST_UPDATE_ID = update["update_id"]
+                
                 if "callback_query" in update:
+                    cb_id = update["callback_query"]["id"]
                     data = update["callback_query"]["data"]
+                    
+                    # VERY IMPORTANT: Tell Telegram we received the click to stop the loading spinner!
+                    requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery?callback_query_id={cb_id}")
+                    
                     if data.startswith("CLAIM_"):
-                        return data.split("_")[1] # Returns the issue ID
+                        return data.split("_")[1] 
                     elif data == "SKIP":
                         return "SKIP"
-        except: pass
+                    elif data == "SCAN":
+                        return "SCAN"
+        except Exception as e: 
+            pass
+            
         time.sleep(2)
     return "TIMEOUT"
 
 # ---------------------------------------------------------
-# 5. THE AUTO-COMMENTER (WITH GEMINI)
+# 5. THE AUTO-COMMENTER 
 # ---------------------------------------------------------
 def execute_claim_protocol(bounty_id):
-    """Handles Advanced Commenting and Auto-Forking."""
     if bounty_id not in BOUNTY_CACHE:
-        send_telegram_msg("❌ Error: Bounty expired from cache. Cannot claim.")
+        send_telegram_msg("❌ Error: Bounty expired from cache. Cannot claim.", silent=False)
         return
 
     bounty = BOUNTY_CACHE[bounty_id]
     send_telegram_msg("🧠 Gemini is reading the repo and drafting the claim...", silent=True)
     
-    # 1. Draft the intelligent comment
     comments_text = fetch_issue_comments(bounty["api_comments_url"])
     smart_comment = generate_advanced_claim(bounty["title"], bounty["body"], comments_text)
     
-    # 2. Post to GitHub
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     response = requests.post(bounty["api_comments_url"], headers=headers, json={"body": smart_comment})
     
     if response.status_code == 201:
-        # 3. Auto-Fork the Repository
         send_telegram_msg(f"✅ `/attempt` posted successfully!\n\n🤖 Cloning repository to your account...", silent=True)
         fork_success, repo_name = fork_repository(bounty["url"])
         
@@ -221,14 +236,14 @@ def execute_claim_protocol(bounty_id):
         else:
             send_telegram_msg(f"⚠️ Claimed successfully, but Auto-Fork failed. Please fork manually.", silent=False)
     else:
-        send_telegram_msg(f"❌ Error posting to GitHub: {response.text}")
+        send_telegram_msg(f"❌ Error posting to GitHub: {response.text}", silent=False)
 
 # ---------------------------------------------------------
 # 6. THE BOT LOOP
 # ---------------------------------------------------------
 def run_bounty_hunter():
     global PREVIOUS_BOUNTY_IDS
-    print("🤖 V3.1 Agent Online. Anti-Spam active.")
+    print("🤖 V3.2 Agent Online. Buttons & Audio fixed.")
     flush_telegram_updates() 
     
     while True:
@@ -241,7 +256,6 @@ def run_bounty_hunter():
                 comments_text = fetch_issue_comments(b["api_comments_url"])
                 verdict = evaluate_bounty(b["title"], b["body"], comments_text)
                 
-                # High standards + Money Filter check
                 if verdict.get("score", 0) >= 7 and verdict.get("is_winnable"):
                     b["score"] = verdict["score"]
                     b["reward"] = verdict.get("reward", "Unknown")
@@ -249,39 +263,53 @@ def run_bounty_hunter():
                     current_ids.append(b["id"])
                     
         if high_score_bounties:
-            # 🛑 THE ANTI-SPAM FIX: Check for duplicates BEFORE doing anything
+            # 🛑 ANTI-SPAM FIX
             if set(current_ids) == set(PREVIOUS_BOUNTY_IDS):
-                print("💤 Bounties are identical to the last scan. Sleeping silently to prevent Telegram spam.")
-                time.sleep(600) # Sleep 10 mins and check again
-                continue # Skips the rest of the loop!
-                
-            # If we made it here, these are brand new bounties!
-            PREVIOUS_BOUNTY_IDS = current_ids
+                print("💤 Duplicate bounties found. Going directly to Active Idle.")
+                # We skip sending anything, and drop into the "Active Idle" waiting phase
+                bounties_found = False 
+            else:
+                PREVIOUS_BOUNTY_IDS = current_ids
+                send_telegram_menu(high_score_bounties) # <--- LOUD Notification!
+                bounties_found = True
+        else:
+            bounties_found = False
+            PREVIOUS_BOUNTY_IDS = []
             
-            send_telegram_menu(high_score_bounties)
-            
-            # Wait 5 minutes (300 seconds) for interaction
+        
+        # --- THE DECISION & WAITING PHASE ---
+        if bounties_found:
+            # We found new bounties. Wait 5 mins for them to claim/skip.
             print("⏳ Waiting 5 mins for Telegram interaction...")
             user_choice = poll_telegram_for_buttons(timeout_seconds=300)
             
             if user_choice == "TIMEOUT":
-                send_telegram_msg("⏭️ 5 mins passed. Auto-skipping.", silent=True)
-                print("⏳ Sleeping for 10 minutes before rescan...")
-                time.sleep(600) # Rescan after 10 mins
-                
+                send_telegram_msg("⏭️ 5 mins passed. Auto-skipping.", silent=True) # <--- SILENT Notification!
+                sleep_mins = 10
             elif user_choice == "SKIP":
-                send_telegram_msg("⏭️ Manual Skip. Entering deep sleep.", silent=True)
-                print("⏳ Sleeping for 15 minutes...")
-                time.sleep(900) # Deep sleep for 15 mins
-                
+                send_telegram_msg("⏭️ Manual Skip. Entering deep sleep.", silent=True) # <--- SILENT Notification!
+                sleep_mins = 15
+            elif user_choice == "SCAN":
+                send_telegram_msg("🚀 Manual scan triggered immediately!", silent=True)
+                continue # Instantly loops back to the top!
             else:
-                # user_choice is the bounty_id from the button!
                 execute_claim_protocol(user_choice)
-                time.sleep(10) # Brief pause after action
+                time.sleep(5) 
+                sleep_mins = 10 # Sleep normally after a claim
         else:
-            print("💤 No high-match cash bounties found. Sleeping 10 mins...")
-            PREVIOUS_BOUNTY_IDS = []
-            time.sleep(600)
+            # No new bounties found (or duplicates). Just idle.
+            sleep_mins = 10
+            print(f"💤 Sleeping for {sleep_mins} mins...")
+
+        # --- THE ACTIVE IDLE PHASE ---
+        # Instead of a dead time.sleep(), we wait but listen for the Scan button
+        send_telegram_idle_menu(sleep_mins) # <--- SILENT Scan button
+        idle_choice = poll_telegram_for_buttons(timeout_seconds=(sleep_mins * 60))
+        
+        if idle_choice == "SCAN":
+            send_telegram_msg("🚀 Manual scan triggered! Checking GitHub now...", silent=True)
+            print("🔍 Manual scan triggered by user.")
+        # If it returns TIMEOUT, the time naturally expired, and the loop restarts on its own!
 
 # ---------------------------------------------------------
 # 7. WEB SERVER
