@@ -23,7 +23,9 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
+# 🛑 SET YOUR DETAILS HERE 🛑
 MY_SKILLS = "TypeScript, Node.js, React, and basic Python."
+MY_GITHUB_USERNAME = "Ramanand-Shirbhate"
 
 # Global State Management
 LAST_UPDATE_ID = None
@@ -56,7 +58,8 @@ def fetch_potential_bounties(limit=5):
         bounty = {
             "id": str(issue["id"]), 
             "title": issue["title"],
-            "url": issue["html_url"],
+            "url": issue["html_url"],               # Web URL for you to click
+            "api_issue_url": issue["url"],          # API URL for pre-flight checks
             "api_comments_url": issue["comments_url"], 
             "body": str(issue["body"])[:2000]
         }
@@ -147,7 +150,6 @@ def send_telegram_menu(bounties_list, comparison_text, show_deep_scan=True):
     
     inline_keyboard = []
     for idx, b in enumerate(bounties_list, 1):
-        # PROTECT AGAINST HTML PARSING ERRORS (The Deep Scan Bug Fix)
         safe_title = html.escape(b['title'])
         safe_reason = html.escape(b.get('reason', 'N/A'))
         safe_reward = html.escape(b.get('reward', 'Unknown'))
@@ -170,23 +172,10 @@ def send_telegram_menu(bounties_list, comparison_text, show_deep_scan=True):
         "reply_markup": {"inline_keyboard": inline_keyboard}
     }
     res = requests.post(url, json=payload).json()
-    if res.get("ok"): return res["result"]["message_id"] # Return ID so we can edit it later
+    if res.get("ok"): return res["result"]["message_id"] 
     return None
 
-def edit_telegram_message(message_id, new_text):
-    """Edits an existing message and strips the buttons away."""
-    if not message_id: return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "message_id": message_id,
-        "text": new_text,
-        "parse_mode": "HTML"
-    }
-    requests.post(url, json=payload)
-
 def delete_telegram_message(message_id):
-    """Deletes a message entirely (used to clean up the 'Sleeping' messages)."""
     if not message_id: return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id})
@@ -224,10 +213,16 @@ def poll_telegram_for_buttons(timeout_seconds):
             for update in res.get("result", []):
                 LAST_UPDATE_ID = update["update_id"]
                 
-                if "callback_query" in update:
+                # Check for standard text messages (like /start)
+                if "message" in update and "text" in update["message"]:
+                    text = update["message"]["text"].strip().lower()
+                    if text == "/start":
+                        return "RESTART"
+                
+                # Check for button clicks
+                elif "callback_query" in update:
                     cb_id = update["callback_query"]["id"]
                     data = update["callback_query"]["data"]
-                    
                     requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery?callback_query_id={cb_id}")
                     
                     if data.startswith("CLAIM_"): return data.split("_")[1] 
@@ -241,28 +236,55 @@ def poll_telegram_for_buttons(timeout_seconds):
     return "TIMEOUT"
 
 # ---------------------------------------------------------
-# 5. THE AUTO-COMMENTER 
+# 5. THE AUTO-COMMENTER (WITH PRE-FLIGHT SAFETY CHECKS)
 # ---------------------------------------------------------
 def execute_claim_protocol(bounty_id):
     if bounty_id not in BOUNTY_CACHE:
-        send_telegram_msg("❌ Error: Bounty expired from cache. Cannot claim.", silent=False)
+        send_telegram_msg("❌ Error: Bounty expired from memory cache. Cannot claim.", silent=False)
         return
 
     bounty = BOUNTY_CACHE[bounty_id]
-    send_telegram_msg("🧠 Gemini is reading the repo and drafting the claim...", silent=True)
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     
+    send_telegram_msg("🛡️ Running pre-flight safety checks on GitHub...", silent=True)
+    
+    # Pre-Flight Check 1: Is it still open and unassigned?
+    issue_data = requests.get(bounty["api_issue_url"], headers=headers).json()
+    if issue_data.get("state") != "open":
+        send_telegram_msg("⚠️ Aborted: Issue was already closed by the maintainer!", silent=False)
+        return
+    if issue_data.get("assignees") or issue_data.get("assignee"):
+        send_telegram_msg("⚠️ Aborted: Someone else was just assigned to this issue!", silent=False)
+        return
+
+    # Pre-Flight Check 2: Check comments for your username or competing claims
+    comments_data = requests.get(bounty["api_comments_url"], headers=headers).json()
+    if isinstance(comments_data, list):
+        for c in comments_data:
+            # Did you already comment?
+            if c.get("user", {}).get("login", "").lower() == MY_GITHUB_USERNAME.lower():
+                send_telegram_msg(f"⚠️ Aborted: You ({MY_GITHUB_USERNAME}) already commented on this issue!", silent=False)
+                return
+            # Did someone else drop an /attempt while we waited?
+            if "/attempt" in str(c.get("body", "")).lower():
+                send_telegram_msg("⚠️ Aborted: Someone else claimed this issue while we were waiting!", silent=False)
+                return
+
+    send_telegram_msg("🧠 Checks passed. Gemini is drafting the claim...", silent=True)
+    
+    # Draft and Post
     comments_text = fetch_issue_comments(bounty["api_comments_url"])
     smart_comment = generate_advanced_claim(bounty["title"], bounty["body"], comments_text)
     
-    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     response = requests.post(bounty["api_comments_url"], headers=headers, json={"body": smart_comment})
     
     if response.status_code == 201:
-        send_telegram_msg(f"✅ `/attempt` posted successfully!\n\n🤖 Cloning repository to your account...", silent=True)
+        send_telegram_msg(f"✅ `/attempt` posted successfully!\n🤖 Cloning repository...", silent=True)
         fork_success, repo_name = fork_repository(bounty["url"])
         
         if fork_success:
-            send_telegram_msg(f"🎯 <b>CLAIM COMPLETE</b>\n\n1. Issue Claimed.\n2. Repo Forked ({repo_name}).\n\nYou are clear to pull and branch.", silent=False)
+            # Direct reply confirmation
+            send_telegram_msg(f"🎯 <b>CLAIM COMPLETE</b>\n\n1. Issue Claimed successfully.\n2. Repo Forked ({repo_name}).\n\nYou are clear to pull and branch.", silent=False)
         else:
             send_telegram_msg(f"⚠️ Claimed successfully, but Auto-Fork failed. Please fork manually.", silent=False)
     else:
@@ -272,8 +294,8 @@ def execute_claim_protocol(bounty_id):
 # 6. THE BOT LOOP
 # ---------------------------------------------------------
 def run_bounty_hunter():
-    global PREVIOUS_BOUNTY_IDS
-    print("🤖 V3.4 Agent Online. Clean UI Active.")
+    global PREVIOUS_BOUNTY_IDS, BOUNTY_CACHE
+    print("🤖 V4 Agent Online. Pre-flight checks active.")
     flush_telegram_updates() 
     
     force_scan = False
@@ -285,7 +307,6 @@ def run_bounty_hunter():
         
         display_bounties = []
         current_ids = []
-        menu_msg_id = None
         
         if bounties:
             for b in bounties:
@@ -309,7 +330,7 @@ def run_bounty_hunter():
                     PREVIOUS_BOUNTY_IDS = current_ids
                 
                 comp_text = "☢️ Deep Scan Active: Showing all unfiltered results." if deep_scan else "Only high-match bounties shown."
-                menu_msg_id = send_telegram_menu(display_bounties, comparison_text=comp_text, show_deep_scan=not deep_scan) 
+                send_telegram_menu(display_bounties, comparison_text=comp_text, show_deep_scan=not deep_scan) 
                 bounties_found = True
         else:
             bounties_found = False
@@ -324,23 +345,27 @@ def run_bounty_hunter():
             print("⏳ Waiting 5 mins for Telegram interaction...")
             user_choice = poll_telegram_for_buttons(timeout_seconds=300)
             
-            # The Clean UI Update: Editing the menu instead of sending a new text!
-            if user_choice == "TIMEOUT":
-                edit_telegram_message(menu_msg_id, "<i>⏲️ Menu expired after 5 minutes. Auto-skipped.</i>")
+            if user_choice == "RESTART":
+                send_telegram_msg("🔄 System Reset Triggered via /start. Clearing cache...", silent=False)
+                PREVIOUS_BOUNTY_IDS = []
+                BOUNTY_CACHE.clear()
+                continue
+            elif user_choice == "TIMEOUT":
+                send_telegram_msg("<i>⏲️ 5 mins passed. Auto-skipped.</i>", silent=True) # Now sends a new silent message
                 sleep_mins = 10
             elif user_choice == "SKIP":
-                edit_telegram_message(menu_msg_id, "<i>⏭️ Bounties skipped manually.</i>")
+                send_telegram_msg("<i>⏭️ Bounties skipped manually.</i>", silent=True) # Now sends a new silent message
                 sleep_mins = 15
             elif user_choice == "SCAN":
-                edit_telegram_message(menu_msg_id, "<i>🚀 Forced scan triggered. Refreshing...</i>")
+                send_telegram_msg("<i>🚀 Forced scan triggered. Refreshing...</i>", silent=True)
                 force_scan = True
                 continue
             elif user_choice == "DEEP_SCAN":
-                edit_telegram_message(menu_msg_id, "<i>☢️ Deep Scan initialized! Fetching unfiltered results...</i>")
+                send_telegram_msg("<i>☢️ Deep Scan initialized! Fetching unfiltered results...</i>", silent=True)
                 deep_scan = True
                 continue
             else:
-                edit_telegram_message(menu_msg_id, f"<i>⏳ Claiming Option...</i>")
+                send_telegram_msg(f"<i>⏳ Claim sequence initiated...</i>", silent=True)
                 execute_claim_protocol(user_choice)
                 time.sleep(5) 
                 sleep_mins = 10 
@@ -351,10 +376,14 @@ def run_bounty_hunter():
         idle_msg_id = send_telegram_idle_menu(sleep_mins)
         idle_choice = poll_telegram_for_buttons(timeout_seconds=(sleep_mins * 60))
         
-        # Clean UI: Delete the "Sleeping" message once we wake up
+        # Deletes the "Sleeping" message once we wake up so UI stays clean!
         delete_telegram_message(idle_msg_id)
         
-        if idle_choice == "SCAN":
+        if idle_choice == "RESTART":
+            send_telegram_msg("🔄 System Reset Triggered via /start. Clearing cache...", silent=False)
+            PREVIOUS_BOUNTY_IDS = []
+            BOUNTY_CACHE.clear()
+        elif idle_choice == "SCAN":
             force_scan = True
         elif idle_choice == "DEEP_SCAN":
             deep_scan = True
