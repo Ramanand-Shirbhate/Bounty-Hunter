@@ -34,7 +34,7 @@ PREVIOUS_BOUNTY_IDS = []
 BOUNTY_CACHE = {}         
 CURRENT_MENU_ID = None
 CURRENT_MENU_TEXT = ""
-CURRENT_MENU_KEYBOARD = [] # NEW: Saves the keyboard so buttons never disappear!
+CURRENT_MENU_KEYBOARD = [] 
 
 # ---------------------------------------------------------
 # HELPER: SANITIZER & MEMORY CACHE
@@ -117,7 +117,7 @@ def fork_repository(html_url):
     except: return False, "Error"
 
 # ---------------------------------------------------------
-# 3. AI ENGINES
+# 3. AI ENGINES (RESTORED COMPARISON OVERVIEW)
 # ---------------------------------------------------------
 def evaluate_bounty(title, body, comments_text):
     system_prompt = f"""
@@ -136,12 +136,37 @@ def evaluate_bounty(title, body, comments_text):
         return json.loads(completion.choices[0].message.content)
     except: return {"score": 0, "is_winnable": False, "reward": "Error", "reason": "AI Error"}
 
+def generate_bounty_comparison(high_score_bounties):
+    """RESTORED: Generates the AI Analyst Verdict for the Telegram Menu."""
+    if len(high_score_bounties) < 2:
+        return "Only one high-match bounty found this round. Fast claim recommended."
+    
+    bounty_context = "".join([f"Option [{i}]: {b['title']} (Score: {b['score']}/10)\nWhy: {b.get('reason', '')}\n\n" for i, b in enumerate(high_score_bounties, 1)])
+    system_prompt = f"You are a technical advisor. My skills: {MY_SKILLS}. Read these summaries and write a 2 sentence comparison stating which is the best/fastest win. No markdown formatting."
+    
+    try:
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": bounty_context}],
+            temperature=0.3 
+        )
+        return completion.choices[0].message.content
+    except: return "Comparison failed."
+
 def generate_advanced_claim(title, body, comments):
+    """ADVANCED GEMINI: Analyzes sub-tasks and writes highly specific claims."""
     prompt = f"""
     I want to claim this GitHub bounty. Write a highly professional comment to post.
-    Start with exactly "/attempt".
-    Read the issue body, infer which files/modules need to be edited, and state that I will begin auditing/working on those specific modules. 
-    Keep it concise, confident, and under 4 sentences.
+    My username is {GITHUB_USERNAME}. My skills are {MY_SKILLS}.
+    
+    CRITICAL INSTRUCTIONS:
+    1. Start the comment with exactly "/attempt" (so the Algora bot registers it).
+    2. Analyze the 'Body' to see if there are multiple sub-tasks or checkboxes.
+    3. Analyze the 'Existing Comments' to determine which sub-tasks have ALREADY been claimed by other users.
+    4. Explicitly state WHICH specific, unclaimed sub-task(s) I am claiming. Do not claim something already taken!
+    5. Mention that I am setting up my local environment and will submit a clean PR soon.
+    6. Match a polite, highly professional tone.
+    7. Keep it concise (under 4 sentences).
     
     Title: {title}
     Body: {body}
@@ -151,7 +176,7 @@ def generate_advanced_claim(title, body, comments):
         response = gemini_model.generate_content(prompt)
         return response.text.strip()
     except:
-        return "/attempt\n\nHi there! I have strong experience with this stack and would love to take this on. I will begin setting up my environment immediately."
+        return "/attempt\n\nHi there! I have strong experience with this stack and would love to take this on. I will begin setting up my environment and auditing the required modules immediately."
 
 # ---------------------------------------------------------
 # 4. TELEGRAM UI & COMMANDS
@@ -171,7 +196,6 @@ def send_telegram_msg(text, silent=False):
     except: pass
 
 def edit_telegram_menu(status_text, keep_keyboard=True):
-    """Edits the text of the menu but explicitly keeps the buttons visible!"""
     global CURRENT_MENU_ID, CURRENT_MENU_TEXT, CURRENT_MENU_KEYBOARD
     if not CURRENT_MENU_ID: return
     
@@ -184,21 +208,22 @@ def edit_telegram_menu(status_text, keep_keyboard=True):
     try: http.post(url, json=payload, timeout=10)
     except: pass
 
-def send_new_menu(bounties_list, comparison_text, is_manual=False):
+def send_new_menu(bounties_list, comparison_text, is_manual=False, is_deep=False):
     global CURRENT_MENU_ID, CURRENT_MENU_TEXT, CURRENT_MENU_KEYBOARD
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
-    header = "🎯 <b>On-Demand Audit:</b>" if is_manual else "🚨 <b>Found Bounties!</b>"
-    message = f"{header} <i>{escape_html(comparison_text)}</i>\n\n" + "➖"*15 + "\n\n"
+    header = "🎯 <b>On-Demand Audit:</b>" if is_manual else ("☢️ <b>Deep Scan Results:</b>" if is_deep else "🚨 <b>Found Bounties!</b>")
+    message = f"{header}\n\n🤖 <b>AI Verdict:</b> <i>{escape_html(comparison_text)}</i>\n\n" + "➖"*15 + "\n\n"
     inline_keyboard = []
     
     for idx, b in enumerate(bounties_list, 1):
-        message += f"<b>[{idx}] {escape_html(b['title'])}</b>\nScore: {b['score']}/10 | 💰 {escape_html(b['reward'])}\n<a href='{b['url']}'>🔗 View on GitHub</a>\n\n"
+        message += f"<b>[{idx}] {escape_html(b['title'])}</b>\nScore: {b['score']}/10 | 💰 {escape_html(b['reward'])}\n"
+        if is_manual or is_deep: message += f"<i>Reason: {escape_html(b.get('reason', 'N/A'))}</i>\n"
+        message += f"<a href='{b['url']}'>🔗 View on GitHub</a>\n\n"
         inline_keyboard.append([{"text": f"✅ Claim Option {idx}", "callback_data": f"CLAIM_{b['id']}"}])
     
-    # PERMANENT BUTTONS: Scan Now and Skip are always attached.
     scan_row = [{"text": "🔍 Scan Now", "callback_data": "SCAN"}]
-    if not is_manual: scan_row.append({"text": "☢️ Deep Scan", "callback_data": "DEEP_SCAN"})
+    if not is_manual and not is_deep: scan_row.append({"text": "☢️ Deep Scan", "callback_data": "DEEP_SCAN"})
     
     inline_keyboard.append(scan_row)
     inline_keyboard.append([{"text": "⏭️ Skip All", "callback_data": "SKIP"}])
@@ -226,19 +251,16 @@ def poll_telegram_for_buttons(timeout_seconds):
             for update in res.get("result", []):
                 LAST_UPDATE_ID = update["update_id"]
                 
-                # Button Click
                 if "callback_query" in update:
                     data = update["callback_query"]["data"]
                     http.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery?callback_query_id={update['callback_query']['id']}", timeout=5)
                     if data.startswith("CLAIM_"): return data.split("_")[1] 
                     return data
                 
-                # Text Message Commands
                 elif "message" in update and "text" in update["message"]:
                     txt = update["message"]["text"].strip()
                     txt_upper = txt.upper()
                     
-                    # Intercept GitHub Links AND /link command
                     if txt_upper.startswith("/LINK") or "GITHUB.COM" in txt_upper:
                         url_match = re.search(r"github\.com/([\w.-]+)/([\w.-]+)/issues/(\d+)", txt)
                         if url_match: return {"type": "LINK", "owner": url_match.group(1), "repo": url_match.group(2), "num": url_match.group(3)}
@@ -263,7 +285,7 @@ def execute_claim_protocol(bounty_id):
         edit_telegram_menu(f"⚠️ <i>Already claimed by {GITHUB_USERNAME}!</i>", keep_keyboard=True)
         return
         
-    edit_telegram_menu("<i>🧠 Gemini is drafting the claim...</i>", keep_keyboard=True)
+    edit_telegram_menu("<i>🧠 Gemini is analyzing the issue and drafting the claim...</i>", keep_keyboard=True)
     smart_comment = generate_advanced_claim(bounty["title"], bounty["body"], comments_text)
     
     try:
@@ -281,7 +303,7 @@ def run_bounty_hunter():
     flush_telegram_updates()
     force_scan, deep_scan, manual_link = False, False, None
 
-    print("🤖 V4.6 Agent Online. Flawless Restart & Persistent Buttons.")
+    print("🤖 V4.7 Agent Online. Restored AI Verdict & Advanced Gemini Drafter.")
 
     while True:
         is_manual_scan = False
@@ -307,8 +329,13 @@ def run_bounty_hunter():
                 edit_telegram_menu(f"<i>Last silent refresh: {time.strftime('%H:%M')} (No new bounties)</i>", keep_keyboard=True)
             else:
                 if not (deep_scan or is_manual_scan): PREVIOUS_BOUNTY_IDS = current_ids
-                comp_text = "Analysis complete." if is_manual_scan else ("Deep Scan Results" if deep_scan else "New Bounties Found")
-                send_new_menu(display_bounties, comp_text, is_manual=is_manual_scan)
+                
+                # GET THE AI COMPARISON TEXT
+                if is_manual_scan: comp_text = "Target Audit Complete."
+                elif deep_scan: comp_text = "Unfiltered results listed below."
+                else: comp_text = generate_bounty_comparison(display_bounties)
+                
+                send_new_menu(display_bounties, comp_text, is_manual=is_manual_scan, is_deep=deep_scan)
         else:
             if is_manual_scan: edit_telegram_menu("<i>❌ Error: Could not fetch data from link.</i>", keep_keyboard=True)
         
@@ -328,7 +355,7 @@ def run_bounty_hunter():
         elif res not in ["TIMEOUT", "SKIP"]:
             execute_claim_protocol(res)
 
-        # Phase 2: Idle wait (Users can still click Claim/Scan because buttons never disappear!)
+        # Phase 2: Idle wait
         edit_telegram_menu(f"<i>💤 Next auto-scan at {time.strftime('%H:%M', time.localtime(time.time()+600))}</i>", keep_keyboard=True)
         
         idle = poll_telegram_for_buttons(timeout_seconds=600)
@@ -339,14 +366,14 @@ def run_bounty_hunter():
             send_telegram_msg("<i>🔄 System Restarting... Cache cleared!</i>", silent=False)
             PREVIOUS_BOUNTY_IDS, CURRENT_MENU_ID, CURRENT_MENU_KEYBOARD = [], None, []; force_scan = True
         elif idle not in ["TIMEOUT", "SKIP"]:
-            execute_claim_protocol(idle) # Let them claim late during the idle phase!
+            execute_claim_protocol(idle) 
 
 # ---------------------------------------------------------
 # 7. WEB SERVER
 # ---------------------------------------------------------
 app = Flask(__name__)
 @app.route('/')
-def home(): return "🤖 Agent V4.6 Online - Persistent UI Active"
+def home(): return "🤖 Agent V4.7 Online"
 
 if __name__ == "__main__":
     threading.Thread(target=run_bounty_hunter, daemon=True).start()
