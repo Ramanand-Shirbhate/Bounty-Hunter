@@ -3,7 +3,6 @@ import json
 import time
 import threading
 import requests
-import html
 from flask import Flask
 from groq import Groq
 import google.generativeai as genai
@@ -23,9 +22,7 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
-# 🛑 SET YOUR DETAILS HERE 🛑
 MY_SKILLS = "TypeScript, Node.js, React, and basic Python."
-MY_GITHUB_USERNAME = "Ramanand-Shirbhate"
 
 # Global State Management
 LAST_UPDATE_ID = None
@@ -33,7 +30,15 @@ PREVIOUS_BOUNTY_IDS = []
 BOUNTY_CACHE = {}         
 
 # ---------------------------------------------------------
-# 2. GITHUB DATA FETCHERS & ACTIONS
+# HELPER: HTML SANITIZER
+# ---------------------------------------------------------
+def escape_html(text):
+    """Prevents Telegram from crashing when titles or AI reasons contain <, >, or &."""
+    if not text: return "N/A"
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+# ---------------------------------------------------------
+# 2. GITHUB DATA FETCHERS
 # ---------------------------------------------------------
 def fetch_potential_bounties(limit=5):
     url = "https://api.github.com/search/issues"
@@ -41,7 +46,7 @@ def fetch_potential_bounties(limit=5):
     query = "is:issue is:open label:bounty no:assignee"
     params = {"q": query, "sort": "created", "order": "desc", "per_page": limit}
     
-    print(f"\n🔍 Scouting GitHub for {limit} bounties...")
+    print(f"\n🔍 Scouting GitHub for {limit} fresh bounties...")
     response = requests.get(url, headers=headers, params=params)
     if response.status_code != 200:
         return []
@@ -58,8 +63,7 @@ def fetch_potential_bounties(limit=5):
         bounty = {
             "id": str(issue["id"]), 
             "title": issue["title"],
-            "url": issue["html_url"],               # Web URL for you to click
-            "api_issue_url": issue["url"],          # API URL for pre-flight checks
+            "url": issue["html_url"],
             "api_comments_url": issue["comments_url"], 
             "body": str(issue["body"])[:2000]
         }
@@ -84,16 +88,13 @@ def fork_repository(html_url):
         owner, repo = parts[3], parts[4]
         url = f"https://api.github.com/repos/{owner}/{repo}/forks"
         headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-        
         response = requests.post(url, headers=headers)
-        if response.status_code in [202, 201]:
-            return True, repo
+        if response.status_code in [202, 201]: return True, repo
         return False, "API blocked fork."
-    except Exception as e:
-        return False, str(e)
+    except Exception as e: return False, str(e)
 
 # ---------------------------------------------------------
-# 3. AI ENGINES (GROQ & GEMINI)
+# 3. AI ENGINES
 # ---------------------------------------------------------
 def evaluate_bounty(title, body, comments_text):
     system_prompt = f"""
@@ -134,7 +135,7 @@ def generate_advanced_claim(title, body, comments):
         return "/attempt\n\nHi there! I have strong experience with this stack and would love to take this on. I will begin setting up my environment and auditing the required modules immediately."
 
 # ---------------------------------------------------------
-# 4. TELEGRAM UI & MESSAGE EDITING
+# 4. TELEGRAM COMMUNICATION 
 # ---------------------------------------------------------
 def flush_telegram_updates():
     global LAST_UPDATE_ID
@@ -146,16 +147,18 @@ def flush_telegram_updates():
 
 def send_telegram_menu(bounties_list, comparison_text, show_deep_scan=True):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    message = f"🚨 <b>Found Bounties!</b>\n\n🤖 <b>Analyst Verdict:</b>\n<i>{comparison_text}</i>\n\n" + "➖"*15 + "\n\n"
+    
+    safe_comp_text = escape_html(comparison_text)
+    message = f"🚨 <b>Found Bounties!</b>\n\n🤖 <b>Analyst Verdict:</b>\n<i>{safe_comp_text}</i>\n\n" + "➖"*15 + "\n\n"
     
     inline_keyboard = []
     for idx, b in enumerate(bounties_list, 1):
-        safe_title = html.escape(b['title'])
-        safe_reason = html.escape(b.get('reason', 'N/A'))
-        safe_reward = html.escape(b.get('reward', 'Unknown'))
+        safe_title = escape_html(b['title'])
+        safe_reward = escape_html(b.get('reward', 'Unknown'))
+        safe_reason = escape_html(b.get('reason', 'N/A'))
         
         message += f"<b>[{idx}] {safe_title}</b>\nScore: {b['score']}/10 | 💰 {safe_reward}\n"
-        message += f"<i>Reason: {safe_reason}</i>\n"
+        message += f"<i>Reason: {safe_reason}</i>\n" 
         message += f"<a href='{b['url']}'>🔗 View on GitHub</a>\n\n"
         
         inline_keyboard.append([{"text": f"✅ Claim Option {idx}", "callback_data": f"CLAIM_{b['id']}"}])
@@ -168,36 +171,39 @@ def send_telegram_menu(bounties_list, comparison_text, show_deep_scan=True):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID, 
         "text": message, 
-        "parse_mode": "HTML",
-        "reply_markup": {"inline_keyboard": inline_keyboard}
+        "parse_mode": "HTML"
+        # FIX: We completely omit 'disable_notification' here. This forces Telegram to ring loudly.
     }
-    res = requests.post(url, json=payload).json()
-    if res.get("ok"): return res["result"]["message_id"] 
-    return None
-
-def delete_telegram_message(message_id):
-    if not message_id: return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id})
+    
+    response = requests.post(url, json=payload)
+    if response.status_code != 200:
+        print(f"❌ Telegram API Error: {response.text}")
+        send_telegram_msg("❌ Failed to display menu. A bounty title or AI reason contained unsupported characters.", silent=False)
+        return False 
+    return True
 
 def send_telegram_idle_menu(sleep_time_mins):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID, 
-        "text": f"💤 <i>Sleeping for {sleep_time_mins} minutes...</i>", 
-        "parse_mode": "HTML",
-        "reply_markup": {"inline_keyboard": [
-            [{"text": "🔍 Scan GitHub Now", "callback_data": "SCAN"}],
-            [{"text": "☢️ Deep Scan (Bypass Filters)", "callback_data": "DEEP_SCAN"}]
-        ]},
-        "disable_notification": True
+        "text": f"<i>💤 Sleeping for {sleep_time_mins} minutes...</i>", 
+        "parse_mode": "HTML", # FIX: Added HTML parsing here so <i> works
+        "reply_markup": {"inline_keyboard": [[{"text": "🔍 Scan GitHub Now", "callback_data": "SCAN"}]]},
+        "disable_notification": True 
     }
-    res = requests.post(url, json=payload).json()
-    if res.get("ok"): return res["result"]["message_id"]
-    return None
+    requests.post(url, json=payload)
 
 def send_telegram_msg(text, silent=False):
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_notification": silent}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID, 
+        "text": text, 
+        "parse_mode": "HTML" # FIX: Added HTML parsing so your custom <i> tags work perfectly!
+    }
+    
+    # Only add the silent flag if we specifically ask for it. Otherwise, it defaults to LOUD.
+    if silent:
+        payload["disable_notification"] = True
+        
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload)
 
 def poll_telegram_for_buttons(timeout_seconds):
@@ -213,14 +219,8 @@ def poll_telegram_for_buttons(timeout_seconds):
             for update in res.get("result", []):
                 LAST_UPDATE_ID = update["update_id"]
                 
-                # Check for standard text messages (like /start)
-                if "message" in update and "text" in update["message"]:
-                    text = update["message"]["text"].strip().lower()
-                    if text == "/start":
-                        return "RESTART"
-                
-                # Check for button clicks
-                elif "callback_query" in update:
+                # Check for Button Clicks
+                if "callback_query" in update:
                     cb_id = update["callback_query"]["id"]
                     data = update["callback_query"]["data"]
                     requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery?callback_query_id={cb_id}")
@@ -229,62 +229,39 @@ def poll_telegram_for_buttons(timeout_seconds):
                     elif data == "SKIP": return "SKIP"
                     elif data == "SCAN": return "SCAN"
                     elif data == "DEEP_SCAN": return "DEEP_SCAN"
-        except Exception: 
-            pass
-            
+                    
+                # Check for Text Commands (like /start)
+                elif "message" in update and "text" in update["message"]:
+                    text = update["message"]["text"].strip().upper()
+                    if text in ["/START", "/SCAN"]:
+                        return "SCAN"
+        except Exception: pass
         time.sleep(2)
     return "TIMEOUT"
 
 # ---------------------------------------------------------
-# 5. THE AUTO-COMMENTER (WITH PRE-FLIGHT SAFETY CHECKS)
+# 5. AUTO-COMMENTER 
 # ---------------------------------------------------------
 def execute_claim_protocol(bounty_id):
     if bounty_id not in BOUNTY_CACHE:
-        send_telegram_msg("❌ Error: Bounty expired from memory cache. Cannot claim.", silent=False)
+        send_telegram_msg("❌ Error: Bounty expired from cache. Cannot claim.", silent=False)
         return
 
     bounty = BOUNTY_CACHE[bounty_id]
-    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    send_telegram_msg("<i>⏳ Claim sequence initiated...</i>", silent=True)
+    send_telegram_msg("🧠 Gemini is reading the repo and drafting the claim...", silent=True)
     
-    send_telegram_msg("🛡️ Running pre-flight safety checks on GitHub...", silent=True)
-    
-    # Pre-Flight Check 1: Is it still open and unassigned?
-    issue_data = requests.get(bounty["api_issue_url"], headers=headers).json()
-    if issue_data.get("state") != "open":
-        send_telegram_msg("⚠️ Aborted: Issue was already closed by the maintainer!", silent=False)
-        return
-    if issue_data.get("assignees") or issue_data.get("assignee"):
-        send_telegram_msg("⚠️ Aborted: Someone else was just assigned to this issue!", silent=False)
-        return
-
-    # Pre-Flight Check 2: Check comments for your username or competing claims
-    comments_data = requests.get(bounty["api_comments_url"], headers=headers).json()
-    if isinstance(comments_data, list):
-        for c in comments_data:
-            # Did you already comment?
-            if c.get("user", {}).get("login", "").lower() == MY_GITHUB_USERNAME.lower():
-                send_telegram_msg(f"⚠️ Aborted: You ({MY_GITHUB_USERNAME}) already commented on this issue!", silent=False)
-                return
-            # Did someone else drop an /attempt while we waited?
-            if "/attempt" in str(c.get("body", "")).lower():
-                send_telegram_msg("⚠️ Aborted: Someone else claimed this issue while we were waiting!", silent=False)
-                return
-
-    send_telegram_msg("🧠 Checks passed. Gemini is drafting the claim...", silent=True)
-    
-    # Draft and Post
     comments_text = fetch_issue_comments(bounty["api_comments_url"])
     smart_comment = generate_advanced_claim(bounty["title"], bounty["body"], comments_text)
     
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     response = requests.post(bounty["api_comments_url"], headers=headers, json={"body": smart_comment})
     
     if response.status_code == 201:
-        send_telegram_msg(f"✅ `/attempt` posted successfully!\n🤖 Cloning repository...", silent=True)
+        send_telegram_msg(f"✅ `/attempt` posted successfully!\n\n🤖 Cloning repository to your account...", silent=True)
         fork_success, repo_name = fork_repository(bounty["url"])
-        
         if fork_success:
-            # Direct reply confirmation
-            send_telegram_msg(f"🎯 <b>CLAIM COMPLETE</b>\n\n1. Issue Claimed successfully.\n2. Repo Forked ({repo_name}).\n\nYou are clear to pull and branch.", silent=False)
+            send_telegram_msg(f"🎯 <b>CLAIM COMPLETE</b>\n\n1. Issue Claimed.\n2. Repo Forked ({repo_name}).\n\nYou are clear to pull and branch.", silent=False)
         else:
             send_telegram_msg(f"⚠️ Claimed successfully, but Auto-Fork failed. Please fork manually.", silent=False)
     else:
@@ -294,8 +271,8 @@ def execute_claim_protocol(bounty_id):
 # 6. THE BOT LOOP
 # ---------------------------------------------------------
 def run_bounty_hunter():
-    global PREVIOUS_BOUNTY_IDS, BOUNTY_CACHE
-    print("🤖 V4 Agent Online. Pre-flight checks active.")
+    global PREVIOUS_BOUNTY_IDS
+    print("🤖 V3.5 Agent Online. Notifications and HTML parsing fixed.")
     flush_telegram_updates() 
     
     force_scan = False
@@ -323,69 +300,63 @@ def run_bounty_hunter():
                     
         if display_bounties:
             if not force_scan and not deep_scan and set(current_ids) == set(PREVIOUS_BOUNTY_IDS):
-                print("💤 Duplicate bounties found. Skipping Telegram menu.")
+                print("💤 Duplicate bounties found. Going directly to Active Idle.")
                 bounties_found = False 
             else:
-                if not deep_scan:
-                    PREVIOUS_BOUNTY_IDS = current_ids
+                if not deep_scan: PREVIOUS_BOUNTY_IDS = current_ids
                 
                 comp_text = "☢️ Deep Scan Active: Showing all unfiltered results." if deep_scan else "Only high-match bounties shown."
-                send_telegram_menu(display_bounties, comparison_text=comp_text, show_deep_scan=not deep_scan) 
-                bounties_found = True
+                
+                # Check if Telegram accepted the message!
+                menu_sent = send_telegram_menu(display_bounties, comparison_text=comp_text, show_deep_scan=not deep_scan) 
+                
+                if menu_sent:
+                    bounties_found = True
+                else:
+                    bounties_found = False 
         else:
             bounties_found = False
-            if not deep_scan:
-                PREVIOUS_BOUNTY_IDS = []
+            if not deep_scan: PREVIOUS_BOUNTY_IDS = []
                 
         force_scan = False
         deep_scan = False
         
-        # --- THE DECISION PHASE ---
+        # --- DECISION PHASE ---
         if bounties_found:
             print("⏳ Waiting 5 mins for Telegram interaction...")
             user_choice = poll_telegram_for_buttons(timeout_seconds=300)
             
-            if user_choice == "RESTART":
-                send_telegram_msg("🔄 System Reset Triggered via /start. Clearing cache...", silent=False)
-                PREVIOUS_BOUNTY_IDS = []
-                BOUNTY_CACHE.clear()
-                continue
-            elif user_choice == "TIMEOUT":
-                send_telegram_msg("<i>⏲️ 5 mins passed. Auto-skipped.</i>", silent=True) # Now sends a new silent message
+            if user_choice == "TIMEOUT":
+                send_telegram_msg("<i>⏭️ 5 mins passed. Auto-skipping.</i>", silent=True)
                 sleep_mins = 10
             elif user_choice == "SKIP":
-                send_telegram_msg("<i>⏭️ Bounties skipped manually.</i>", silent=True) # Now sends a new silent message
+                send_telegram_msg("<i>⏭️ Manual Skip. Entering deep sleep.</i>", silent=True)
                 sleep_mins = 15
             elif user_choice == "SCAN":
-                send_telegram_msg("<i>🚀 Forced scan triggered. Refreshing...</i>", silent=True)
+                send_telegram_msg("<i>🚀 Forced scan triggered!</i>", silent=True)
                 force_scan = True
                 continue
             elif user_choice == "DEEP_SCAN":
-                send_telegram_msg("<i>☢️ Deep Scan initialized! Fetching unfiltered results...</i>", silent=True)
+                send_telegram_msg("<i>☢️ Deep Scan initialized! Bypassing all AI filters...</i>", silent=True)
                 deep_scan = True
                 continue
             else:
-                send_telegram_msg(f"<i>⏳ Claim sequence initiated...</i>", silent=True)
                 execute_claim_protocol(user_choice)
                 time.sleep(5) 
                 sleep_mins = 10 
         else:
             sleep_mins = 10
+            print(f"💤 Sleeping for {sleep_mins} mins...")
 
-        # --- THE ACTIVE IDLE PHASE ---
-        idle_msg_id = send_telegram_idle_menu(sleep_mins)
+        # --- ACTIVE IDLE PHASE ---
+        send_telegram_idle_menu(sleep_mins)
         idle_choice = poll_telegram_for_buttons(timeout_seconds=(sleep_mins * 60))
         
-        # Deletes the "Sleeping" message once we wake up so UI stays clean!
-        delete_telegram_message(idle_msg_id)
-        
-        if idle_choice == "RESTART":
-            send_telegram_msg("🔄 System Reset Triggered via /start. Clearing cache...", silent=False)
-            PREVIOUS_BOUNTY_IDS = []
-            BOUNTY_CACHE.clear()
-        elif idle_choice == "SCAN":
+        if idle_choice == "SCAN":
+            send_telegram_msg("<i>🚀 Manual scan triggered! Checking GitHub now...</i>", silent=True)
             force_scan = True
         elif idle_choice == "DEEP_SCAN":
+            send_telegram_msg("<i>☢️ Deep Scan triggered! Checking GitHub now...</i>", silent=True)
             deep_scan = True
 
 # ---------------------------------------------------------
@@ -394,12 +365,8 @@ def run_bounty_hunter():
 app = Flask(__name__)
 
 @app.route('/')
-def home():
-    return "🤖 Algora Bounty Hunter is ALIVE and running!"
+def home(): return "🤖 Algora Bounty Hunter is ALIVE and running!"
 
 if __name__ == "__main__":
-    hunter_thread = threading.Thread(target=run_bounty_hunter, daemon=True)
-    hunter_thread.start()
-    
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    threading.Thread(target=run_bounty_hunter, daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
