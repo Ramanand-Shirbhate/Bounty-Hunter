@@ -18,6 +18,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# Set your exact GitHub username here for the Pre-Flight Check
+GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "Ramanand-Shirbhate")
+
 groq_client = Groq(api_key=GROQ_API_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
@@ -172,7 +175,7 @@ def send_telegram_menu(bounties_list, comparison_text, show_deep_scan=True):
         "text": message, 
         "parse_mode": "HTML",
         "reply_markup": {"inline_keyboard": inline_keyboard},
-        "disable_web_page_preview": True # <-- CRITICAL FIX: Removes the massive GitHub box to fix Telegram UI glitch
+        "disable_web_page_preview": True # Keeps the massive GitHub link previews hidden
     }
     
     response = requests.post(url, json=payload)
@@ -210,6 +213,7 @@ def poll_telegram_for_buttons(timeout_seconds):
             for update in res.get("result", []):
                 LAST_UPDATE_ID = update["update_id"]
                 
+                # Check for Button Clicks
                 if "callback_query" in update:
                     cb_id = update["callback_query"]["id"]
                     data = update["callback_query"]["data"]
@@ -218,6 +222,7 @@ def poll_telegram_for_buttons(timeout_seconds):
                     if data.startswith("CLAIM_"): return data.split("_")[1] 
                     elif data in ["SKIP", "SCAN", "DEEP_SCAN"]: return data
                     
+                # Check for Text Commands
                 elif "message" in update and "text" in update["message"]:
                     text = update["message"]["text"].strip().upper()
                     if text == "/START": return "RESET"
@@ -227,7 +232,7 @@ def poll_telegram_for_buttons(timeout_seconds):
     return "TIMEOUT"
 
 # ---------------------------------------------------------
-# 5. AUTO-COMMENTER 
+# 5. AUTO-COMMENTER (WITH PRE-FLIGHT CHECK)
 # ---------------------------------------------------------
 def execute_claim_protocol(bounty_id):
     if bounty_id not in BOUNTY_CACHE:
@@ -236,9 +241,16 @@ def execute_claim_protocol(bounty_id):
 
     bounty = BOUNTY_CACHE[bounty_id]
     send_telegram_msg("<i>⏳ Claim sequence initiated...</i>", silent=True)
-    send_telegram_msg("<i>🧠 Gemini is reading the repo and drafting the claim...</i>", silent=True)
+    send_telegram_msg("<i>🛡️ Running pre-flight safety checks on GitHub...</i>", silent=True)
     
     comments_text = fetch_issue_comments(bounty["api_comments_url"])
+    
+    # 🚨 PRE-FLIGHT SAFETY CHECK
+    if GITHUB_USERNAME.lower() in comments_text.lower():
+        send_telegram_msg(f"<i>⚠️ Aborted: You ({GITHUB_USERNAME}) already commented on this issue!</i>", silent=False)
+        return
+        
+    send_telegram_msg("<i>🧠 Gemini is reading the repo and drafting the claim...</i>", silent=True)
     smart_comment = generate_advanced_claim(bounty["title"], bounty["body"], comments_text)
     
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
@@ -259,7 +271,7 @@ def execute_claim_protocol(bounty_id):
 # ---------------------------------------------------------
 def run_bounty_hunter():
     global PREVIOUS_BOUNTY_IDS, BOUNTY_CACHE
-    print("🤖 V3.7 Agent Online. Link Previews Disabled for UI Stability.")
+    print("🤖 V3.8 Agent Online. Pre-flight Safety Checks Active.")
     flush_telegram_updates() 
     
     force_scan = False
