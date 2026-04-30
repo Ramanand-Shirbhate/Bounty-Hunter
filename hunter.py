@@ -21,8 +21,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "Ramanand-Shirbhate")
 
-# ⏰ TIME CALIBRATION: Set your timezone offset here (e.g., +5.5 for IST, -4 for EST)
-TIMEZONE_OFFSET_HOURS = 5.5  # Adjust this to match your local time!
+# ⏰ TIME CALIBRATION: Set your timezone offset here (e.g., +5.5 for IST)
+TIMEZONE_OFFSET_HOURS = 5.5  
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
@@ -38,15 +38,12 @@ BOUNTY_CACHE = {}
 CURRENT_MENU_ID = None
 CURRENT_MENU_TEXT = ""
 CURRENT_MENU_KEYBOARD = [] 
-
-# NEW: Task Manager State
-PENDING_TASKS = {} # Format: {"issue_id": {"title": "...", "url": "..."}}
+PENDING_TASKS = {} 
 
 # ---------------------------------------------------------
 # HELPER: TIME, SANITIZER & MEMORY
 # ---------------------------------------------------------
 def get_local_time_str(offset_seconds=0):
-    """Returns perfectly calibrated local time."""
     utc_time = time.time() - time.timezone 
     local_time = utc_time + (TIMEZONE_OFFSET_HOURS * 3600) + offset_seconds
     return time.strftime('%H:%M', time.gmtime(local_time))
@@ -130,9 +127,8 @@ def fork_repository(html_url):
     except: return False, "Error"
 
 def smart_recovery_scan():
-    """Scans recent issues to recover claimed tasks that aren't in the pending list."""
     print("🔄 Running Smart Recovery Scan for previous claims...")
-    bounties = fetch_potential_bounties(limit=15) # Check a slightly larger pool
+    bounties = fetch_potential_bounties(limit=15) 
     for b in bounties:
         comments = fetch_issue_comments(b["api_comments_url"])
         if GITHUB_USERNAME.lower() in comments.lower() and b["id"] not in PENDING_TASKS:
@@ -218,7 +214,8 @@ def send_telegram_msg(text, silent=False):
     try: http.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload, timeout=10)
     except: pass
 
-def edit_telegram_menu(status_text, keep_keyboard=True, new_keyboard=None):
+def edit_telegram_menu(status_text, keep_keyboard=True):
+    """Edits text. If keep_keyboard is False, the buttons disappear instantly!"""
     global CURRENT_MENU_ID, CURRENT_MENU_TEXT, CURRENT_MENU_KEYBOARD
     if not CURRENT_MENU_ID: return
     
@@ -227,15 +224,13 @@ def edit_telegram_menu(status_text, keep_keyboard=True, new_keyboard=None):
     
     payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": CURRENT_MENU_ID, "text": full_text, "parse_mode": "HTML", "disable_web_page_preview": True}
     
-    if new_keyboard: payload["reply_markup"] = {"inline_keyboard": new_keyboard}
-    elif keep_keyboard: payload["reply_markup"] = {"inline_keyboard": CURRENT_MENU_KEYBOARD}
+    if keep_keyboard: payload["reply_markup"] = {"inline_keyboard": CURRENT_MENU_KEYBOARD}
     else: payload["reply_markup"] = {"inline_keyboard": []}
     
     try: http.post(url, json=payload, timeout=10)
     except: pass
 
 def show_pending_tasks():
-    """Displays the Task Manager Dashboard."""
     if not PENDING_TASKS:
         send_telegram_msg("📭 <b>Task Manager:</b> You currently have 0 pending bounties.")
         return
@@ -249,6 +244,9 @@ def show_pending_tasks():
             {"text": f"✅ Mark {idx} Done", "callback_data": f"TASKDONE_{task_id}"},
             {"text": f"❌ Drop {idx}", "callback_data": f"TASKDROP_{task_id}"}
         ])
+    
+    # 🙈 The new hide button!
+    inline_keyboard.append([{"text": "🙈 Hide Dashboard", "callback_data": "HIDE_PENDING"}])
         
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "reply_markup": {"inline_keyboard": inline_keyboard}, "disable_web_page_preview": True}
     try: http.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload, timeout=10)
@@ -272,8 +270,6 @@ def send_new_menu(bounties_list, comparison_text, is_manual=False, is_deep=False
     if not is_manual and not is_deep: scan_row.append({"text": "☢️ Deep Scan", "callback_data": "DEEP_SCAN"})
     
     inline_keyboard.append(scan_row)
-    
-    # NEW: Pending Tasks Button
     if PENDING_TASKS: inline_keyboard.append([{"text": f"📋 View Pending ({len(PENDING_TASKS)})", "callback_data": "VIEW_PENDING"}])
     inline_keyboard.append([{"text": "⏭️ Skip All", "callback_data": "SKIP"}])
     
@@ -302,8 +298,18 @@ def poll_telegram_for_buttons(timeout_seconds):
                 
                 if "callback_query" in update:
                     data = update["callback_query"]["data"]
+                    msg_id = update["callback_query"]["message"]["message_id"]
                     http.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery?callback_query_id={update['callback_query']['id']}", timeout=5)
                     
+                    # 🙈 HIDE DASHBOARD MECHANIC: Instantly delete the message
+                    if data == "HIDE_PENDING":
+                        http.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": msg_id}, timeout=5)
+                        continue # Keep listening
+                    
+                    # 🚀 UX MECHANIC: Instantly strip the keyboard while processing to prevent double clicks!
+                    if data in ["SCAN", "DEEP_SCAN", "SKIP", "VIEW_PENDING"] or data.startswith("CLAIM_"):
+                        http.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": msg_id, "reply_markup": {"inline_keyboard": []}}, timeout=5)
+
                     if data.startswith("CLAIM_"): return data.split("_")[1] 
                     if data.startswith("TASKDONE_") or data.startswith("TASKDROP_"): return data
                     return data
@@ -334,23 +340,23 @@ def execute_claim_protocol(bounty_id):
     comments_text = fetch_issue_comments(bounty["api_comments_url"])
     
     if GITHUB_USERNAME.lower() in comments_text.lower():
+        # Keep keyboard = True will make the buttons REAPPEAR magically!
         edit_telegram_menu(f"⚠️ <i>Already claimed by {GITHUB_USERNAME}!</i>", keep_keyboard=True)
-        # Self-Healing: Add it to pending if it's missing!
         if bounty_id not in PENDING_TASKS: PENDING_TASKS[bounty_id] = {"title": bounty["title"], "url": bounty["url"]}
         return
         
-    edit_telegram_menu("<i>🧠 Gemini is analyzing the issue and drafting the claim...</i>", keep_keyboard=True)
+    # keep_keyboard = False hides buttons while drafting
+    edit_telegram_menu("<i>🧠 Gemini is analyzing the issue and drafting the claim...</i>", keep_keyboard=False)
     smart_comment = generate_advanced_claim(bounty["title"], bounty["body"], comments_text)
     
     try:
         response = http.post(bounty["api_comments_url"], headers=headers, json={"body": smart_comment}, timeout=15)
         if response.status_code == 201:
-            edit_telegram_menu("✅ <b>Claimed!</b> Forking repo...", keep_keyboard=True)
+            edit_telegram_menu("✅ <b>Claimed!</b> Forking repo...", keep_keyboard=False)
             fork_success, repo_name = fork_repository(bounty["url"])
-            
-            # Add to Task Manager!
             PENDING_TASKS[bounty["id"]] = {"title": bounty["title"], "url": bounty["url"]}
             
+            # keep_keyboard = True restores the buttons now that we are done!
             if fork_success: edit_telegram_menu(f"🎯 <b>CLAIM COMPLETE</b>\nAdded to Task Manager.\nRepo Forked: {repo_name}", keep_keyboard=True)
             else: edit_telegram_menu(f"⚠️ Claimed and added to Task Manager, but Auto-Fork failed.", keep_keyboard=True)
         else: edit_telegram_menu(f"❌ Error posting to GitHub.", keep_keyboard=True)
@@ -360,8 +366,8 @@ def run_bounty_hunter():
     global PREVIOUS_BOUNTY_IDS, CURRENT_MENU_ID, CURRENT_MENU_KEYBOARD, PENDING_TASKS
     flush_telegram_updates()
     
-    print(f"🤖 V4.9 Agent Online. Time calibrated. Task Manager active.")
-    smart_recovery_scan() # Recover any lost claims on boot!
+    print(f"🤖 V5.0 Agent Online. Dynamic Button UX Active.")
+    smart_recovery_scan() 
 
     force_scan, deep_scan, manual_link = False, False, None
 
@@ -389,7 +395,6 @@ def run_bounty_hunter():
                 edit_telegram_menu(f"<i>Last silent refresh: {get_local_time_str()} (No new bounties)</i>", keep_keyboard=True)
             else:
                 if not (deep_scan or is_manual_scan): PREVIOUS_BOUNTY_IDS = current_ids
-                
                 if is_manual_scan: comp_text = "Target Audit Complete."
                 elif deep_scan: comp_text = "Unfiltered results listed below."
                 else: comp_text = generate_bounty_comparison(display_bounties)
@@ -410,15 +415,16 @@ def run_bounty_hunter():
             elif res == "SCAN": force_scan = True; break
             elif res == "DEEP_SCAN": deep_scan = True; break
             elif res == "RESET": 
-                send_telegram_msg("<i>🔄 System Restarting...</i>", silent=False)
+                send_telegram_msg("<i>🔄 System Restarting... Triggering fresh scan.</i>", silent=False)
                 PREVIOUS_BOUNTY_IDS, CURRENT_MENU_ID, CURRENT_MENU_KEYBOARD = [], None, []; force_scan = True; break
             elif res == "VIEW_PENDING":
                 show_pending_tasks()
+                edit_telegram_menu("", keep_keyboard=True) # Bring buttons back to main menu
             elif res and res.startswith("TASKDONE_"):
                 tid = res.split("_")[1]
                 if tid in PENDING_TASKS: 
                     del PENDING_TASKS[tid]
-                    send_telegram_msg("✅ Task marked as complete and removed from checklist!")
+                    send_telegram_msg("✅ Task marked as complete!")
             elif res and res.startswith("TASKDROP_"):
                 tid = res.split("_")[1]
                 if tid in PENDING_TASKS:
@@ -426,9 +432,9 @@ def run_bounty_hunter():
                     send_telegram_msg("🗑️ Task dropped from checklist.")
             elif res:
                 execute_claim_protocol(res)
-                break # Move to idle phase after claim
+                break 
 
-        if force_scan or manual_link or deep_scan: continue # Skip idle if we forced a scan
+        if force_scan or manual_link or deep_scan: continue 
 
         # Phase 2: Idle wait
         edit_telegram_menu(f"<i>💤 Next auto-scan at {get_local_time_str(600)}</i>", keep_keyboard=True)
@@ -439,8 +445,12 @@ def run_bounty_hunter():
             if isinstance(idle, dict) and idle.get("type") == "LINK": manual_link = idle; break
             elif idle == "SCAN": force_scan = True; break
             elif idle == "DEEP_SCAN": deep_scan = True; break
-            elif idle == "RESET": PREVIOUS_BOUNTY_IDS, CURRENT_MENU_ID, CURRENT_MENU_KEYBOARD = [], None, []; force_scan = True; break
-            elif idle == "VIEW_PENDING": show_pending_tasks()
+            elif idle == "RESET": 
+                send_telegram_msg("<i>🔄 System Restarting... Triggering fresh scan.</i>", silent=False)
+                PREVIOUS_BOUNTY_IDS, CURRENT_MENU_ID, CURRENT_MENU_KEYBOARD = [], None, []; force_scan = True; break
+            elif idle == "VIEW_PENDING": 
+                show_pending_tasks()
+                edit_telegram_menu(f"<i>💤 Next auto-scan at {get_local_time_str(600)}</i>", keep_keyboard=True)
             elif idle and idle.startswith("TASKDONE_"):
                 tid = idle.split("_")[1]
                 if tid in PENDING_TASKS: del PENDING_TASKS[tid]; send_telegram_msg("✅ Task marked as complete!")
@@ -454,7 +464,7 @@ def run_bounty_hunter():
 # ---------------------------------------------------------
 app = Flask(__name__)
 @app.route('/')
-def home(): return "🤖 Agent V4.9 Online - Task Manager Active"
+def home(): return "🤖 Agent V5.0 Online - UI Engine Perfected"
 
 if __name__ == "__main__":
     threading.Thread(target=run_bounty_hunter, daemon=True).start()
